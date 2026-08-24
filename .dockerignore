@@ -1,0 +1,12 @@
+# Keep docker build contexts small
+**/bin/
+**/obj/
+web/node_modules/
+web/.next/
+.git/
+.github/
+docs/
+scripts/
+tests/
+*.md
+docker-compose.yml

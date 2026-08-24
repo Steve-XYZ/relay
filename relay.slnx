@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Relay.Cli/Relay.Cli.csproj" />
+    <Project Path="src/Relay.Core/Relay.Core.csproj" />
+    <Project Path="src/Relay.Server/Relay.Server.csproj" />
+    <Project Path="src/Relay.Worker/Relay.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Relay.Core.Tests/Relay.Core.Tests.csproj" />
+    <Project Path="tests/Relay.Server.Tests/Relay.Server.Tests.csproj" />
+  </Folder>
+</Solution>

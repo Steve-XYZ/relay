@@ -1,0 +1,71 @@
+name: relay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/relay-server.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__relay: Host=postgres;Database=relay;Username=relay;Password=relay
+      ASPNETCORE_URLS: http://+:8080
+      Otel__OtlpEndpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    ports:
+      - "8080:8080"
+
+  sandbox-image:
+    build:
+      context: .
+      dockerfile: docker/sandbox.Dockerfile
+    image: relay-sandbox:latest
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/relay-worker.Dockerfile
+    depends_on:
+      - server
+      - sandbox-image
+    environment:
+      RELAY_SERVER_URL: http://server:8080
+      RELAY_WORKER_NAME: compose-worker
+      SANDBOX_MODE: docker
+      WORKSPACE_ROOT: /workspaces
+      RELAY_CREATE_PR: "false"
+    volumes:
+      # Workers spawn sibling sandbox containers that bind-mount job workspaces,
+      # so both containers must see the same host paths.
+      - workspaces:/workspaces
+      - /var/run/docker.sock:/var/run/docker.sock
+    pid: "host"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args:
+        NEXT_PUBLIC_RELAY_URL: http://localhost:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - server
+
+volumes:
+  pgdata:
+  workspaces:

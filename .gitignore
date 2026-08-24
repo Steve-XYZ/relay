@@ -1,0 +1,25 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+TestResults/
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Relay local state
+/tmp/
+*.log
