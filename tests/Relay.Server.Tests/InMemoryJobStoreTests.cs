@@ -192,3 +192,146 @@ public class InMemoryJobStoreTests
         Assert.True(completedJob.Result!.TestsPassed);
     }
 }
+
+/// <summary>
+/// Guarantees the control plane now leans on: a stale worker must not be able to write
+/// anything, and a recovered job must carry forward what earlier attempts already spent.
+/// </summary>
+public class JobLeaseGuaranteeTests
+{
+    private static readonly TimeSpan Lease = TimeSpan.FromSeconds(15);
+
+    private static (InMemoryJobStore Store, MutableTimeProvider Clock) Create()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-09T12:00:00Z"));
+        return (new InMemoryJobStore(clock), clock);
+    }
+
+    private static Task<Job> CreateJobAsync(InMemoryJobStore store) =>
+        store.CreateJobAsync(new CreateJobRequest { RepoUrl = "r", Prompt = "p" }, CancellationToken.None);
+
+    [Fact]
+    public async Task A_valid_lease_is_what_authorizes_event_and_checkpoint_writes()
+    {
+        // The internal API gates /events and /checkpoints on exactly this check. Those calls
+        // change no status, but a stale worker able to make them could poison the checkpoint
+        // a recovered worker resumes from.
+        var (store, clock) = Create();
+        var job = await CreateJobAsync(store);
+        var claim = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+
+        Assert.True(await store.HasValidLeaseAsync(job.Id, claim!.Value.LeaseToken, CancellationToken.None));
+        Assert.False(await store.HasValidLeaseAsync(job.Id, Guid.NewGuid(), CancellationToken.None));
+
+        clock.Advance(TimeSpan.FromSeconds(16));
+        Assert.False(await store.HasValidLeaseAsync(job.Id, claim.Value.LeaseToken, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_recovered_job_cannot_be_heartbeated_by_the_worker_that_lost_it()
+    {
+        var (store, clock) = Create();
+        var job = await CreateJobAsync(store);
+        var claim = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+        var stale = claim!.Value.LeaseToken;
+        await store.TransitionWithLeaseAsync(job.Id, stale, JobStatus.Running, null, CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromSeconds(16));
+        await store.SweepExpiredLeasesAsync(CancellationToken.None);
+
+        // The lease token is cleared on requeue, so even a clock skew that made the old expiry
+        // look live again could not match it.
+        Assert.Null(await store.HeartbeatAsync(
+            job.Id, stale, Lease, new Usage { TokensIn = 10 }, CancellationToken.None));
+        Assert.False(await store.HasValidLeaseAsync(job.Id, stale, CancellationToken.None));
+
+        var reclaimed = await store.TryClaimAsync(Guid.NewGuid(), "worker-b", Lease, CancellationToken.None);
+        Assert.NotEqual(stale, reclaimed!.Value.LeaseToken);
+        Assert.Null(await store.HeartbeatAsync(job.Id, stale, Lease, null, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_heartbeat_is_refused_once_the_job_is_no_longer_executing()
+    {
+        var (store, _) = Create();
+        var job = await CreateJobAsync(store);
+        var claim = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+        var token = claim!.Value.LeaseToken;
+
+        Assert.NotNull(await store.HeartbeatAsync(job.Id, token, Lease, null, CancellationToken.None));
+
+        await store.TransitionWithLeaseAsync(job.Id, token, JobStatus.Running, null, CancellationToken.None);
+        await store.TransitionAsync(job.Id, JobStatus.Interrupted, "server decided", CancellationToken.None);
+
+        // Lease clock is still live, but the job is not executing any more. Extending it would
+        // let a worker keep a lease alive on work the server has already taken back.
+        Assert.Null(await store.HeartbeatAsync(job.Id, token, Lease, null, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Usage_survives_recovery_so_budgets_span_attempts()
+    {
+        // The worker seeds its budget meter from Job.Usage at claim time. If usage did not
+        // carry across attempts, a job that kept crashing would get a fresh budget every time.
+        var (store, clock) = Create();
+        var job = await CreateJobAsync(store);
+        var first = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+        await store.TransitionWithLeaseAsync(job.Id, first!.Value.LeaseToken, JobStatus.Running, null, CancellationToken.None);
+        await store.HeartbeatAsync(job.Id, first.Value.LeaseToken, Lease,
+            new Usage { TokensIn = 40_000, TokensOut = 20_000, CostUsd = 1.25m }, CancellationToken.None);
+
+        // The heartbeat extended the lease, so expiry is 30s out rather than 15s.
+        clock.Advance(TimeSpan.FromSeconds(31));
+        await store.SweepExpiredLeasesAsync(CancellationToken.None);
+
+        var second = await store.TryClaimAsync(Guid.NewGuid(), "worker-b", Lease, CancellationToken.None);
+        Assert.NotNull(second);
+        Assert.Equal(2, second!.Value.Job.Attempt);
+        Assert.Equal(60_000, second.Value.Job.Usage.TotalTokens);
+        Assert.Equal(1.25m, second.Value.Job.Usage.CostUsd);
+    }
+
+    [Fact]
+    public async Task Completion_is_refused_once_the_lease_has_expired()
+    {
+        // Matches the Postgres guard. Between lease expiry and the sweeper noticing, a worker
+        // the server has given up on must not be able to declare the job done.
+        var (store, clock) = Create();
+        var job = await CreateJobAsync(store);
+        var claim = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+        var token = claim!.Value.LeaseToken;
+        await store.TransitionWithLeaseAsync(job.Id, token, JobStatus.Running, null, CancellationToken.None);
+        await store.TransitionWithLeaseAsync(job.Id, token, JobStatus.Validating, null, CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromSeconds(16));
+
+        Assert.Null(await store.CompleteAsync(
+            job.Id, token, new JobResult { TestsPassed = true }, null, CancellationToken.None));
+        Assert.Null(await store.FailAsync(job.Id, token, "too late", null, CancellationToken.None));
+        Assert.Equal(JobStatus.Validating.ToWire(),
+            (await store.ResolveAsync(job.Id.ToString(), CancellationToken.None))!.Status);
+    }
+
+    [Fact]
+    public async Task Completing_a_job_appends_the_state_transition_to_the_durable_log()
+    {
+        // The log is how the CLI, the web timeline and the control plane reconstruct a job.
+        // A completion missing from it would make replay disagree with the row.
+        var (store, _) = Create();
+        var jobs = TestServiceFactory.CreateJobService(store);
+        var job = await CreateJobAsync(store);
+        var claim = await store.TryClaimAsync(Guid.NewGuid(), "worker-a", Lease, CancellationToken.None);
+        var token = claim!.Value.LeaseToken;
+        await store.TransitionWithLeaseAsync(job.Id, token, JobStatus.Running, null, CancellationToken.None);
+        await store.TransitionWithLeaseAsync(job.Id, token, JobStatus.Validating, null, CancellationToken.None);
+
+        Assert.NotNull(await jobs.CompleteAsync(
+            job.Id, token, new JobResult { Branch = "relay/x", TestsPassed = true }, null, CancellationToken.None));
+
+        var events = await store.GetEventsAsync(job.Id, 0, 100, CancellationToken.None);
+        var transition = Assert.Single(events,
+            e => e.Kind == EventKind.State.ToWire() && e.Data?.GetValueOrDefault("to") == "completed");
+        Assert.Equal("validating", transition.Data!["from"]);
+        Assert.Contains(events, e => e.Message == "job_completed");
+    }
+}

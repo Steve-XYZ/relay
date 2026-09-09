@@ -3,13 +3,18 @@ using System.Net.Http.Json;
 using System.Text;
 using Relay.Core;
 
-// relay — client for the Relay durable agent runtime.
+// relay — client for the Relay reliability control plane.
 //
+// Control plane — what should be happening and what needs intervention:
+//   relay state <project>                    resources, policies, incidents, approvals
+//   relay observe <project> service/api down report what is actually happening
+//   relay incidents                          what requires intervention
+//   relay incident I7F2A                     one incident and its audit trail
+//   relay approve <action-id>                authorize a proposed intervention
+//
+// Execution plane — jobs as the machinery underneath:
 //   relay run "Fix issue BOS-123"            create a job and follow it live
-//   relay list                               recent jobs
-//   relay get 7F2A                           one job as JSON
-//   relay logs 7F2A -f                       stream events
-//   relay cancel 7F2A                        request cancellation
+//   relay list / get / logs / cancel
 //
 var server = Environment.GetEnvironmentVariable("RELAY_URL") ?? "http://localhost:8080";
 var argsList = new List<string>(args);
@@ -29,6 +34,13 @@ switch (command)
     case "get": return await GetCommand(Take() ?? throw Usage("`get <id>` requires a job id"));
     case "logs": return await LogsCommand(Take() ?? throw Usage("`logs <id>` requires a job id"));
     case "cancel": return await CancelCommand(Take() ?? throw Usage("`cancel <id>` requires a job id"));
+    case "projects": return await ProjectsCommand();
+    case "state": return await StateCommand(Take() ?? throw Usage("`state <project>` requires a project"));
+    case "observe": return await ObserveCommand();
+    case "incidents": return await IncidentsCommand();
+    case "incident": return await IncidentCommand(Take() ?? throw Usage("`incident <id>` requires an incident id"));
+    case "approve": return await DecideCommand(Take() ?? throw Usage("`approve <action-id>` requires an action id"), approve: true);
+    case "reject": return await DecideCommand(Take() ?? throw Usage("`reject <action-id>` requires an action id"), approve: false);
     case "--version" or "-v" or "version":
         Console.WriteLine("relay 0.1.0");
         return 0;
@@ -57,9 +69,23 @@ InvalidOperationException Usage(string message)
 void PrintUsage()
 {
     Console.WriteLine("""
-        relay — durable runtime for AI coding agents
+        relay — reliability control plane for software projects
 
-        USAGE
+        PROJECT STATE
+          relay projects                          list projects
+          relay state <project>                   what should be happening vs what is
+          relay incidents [--project P] [--all]   what requires intervention
+          relay incident <short-id>               one incident and its audit trail
+
+        OBSERVE
+          relay observe <project> <kind>/<key> healthy|degraded|unavailable
+                        [--signal S] [--fact k=v] [--source S] [--message M]
+
+        DECIDE
+          relay approve <action-id> [--as NAME]
+          relay reject  <action-id> [--as NAME] [--reason TEXT]
+
+        JOBS (execution machinery)
           relay run [options] "<prompt>"          create a job and follow it live
           relay list [--status queued|running|…]  list recent jobs
           relay get <short-id>                    fetch one job (JSON)
@@ -256,6 +282,226 @@ async Task<int> CancelCommand(string id)
     Console.Error.WriteLine($"cancel failed ({(int)response.StatusCode})");
     return 1;
 }
+
+// ---- control plane ----
+
+async Task<int> ProjectsCommand()
+{
+    using var http = Http(server);
+    var projects = await http.GetFromJsonAsync<List<Project>>("/api/projects", Json.Default) ?? [];
+    if (projects.Count == 0)
+    {
+        Console.WriteLine("(no projects yet)  create one: POST /api/projects {\"slug\":\"my-project\"}");
+        return 0;
+    }
+    foreach (var p in projects) Console.WriteLine($"{p.Slug,-24} {p.Name}");
+    return 0;
+}
+
+/// <summary>The whole picture for one project: desired state, reality, and open work.</summary>
+async Task<int> StateCommand(string project)
+{
+    using var http = Http(server);
+    var response = await http.GetAsync($"/api/projects/{project}/state");
+    if (!response.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"project '{project}' not found");
+        return 1;
+    }
+    var state = (await response.Content.ReadFromJsonAsync<ProjectState>(Json.Default))!;
+
+    Console.WriteLine($"project  {state.Project.Slug}  ({state.Project.Name})");
+    Console.WriteLine();
+
+    Console.WriteLine("RESOURCES");
+    foreach (var r in state.Resources)
+        Console.WriteLine($"  {Health(r.Health)} {$"{r.Kind.ToWire()}/{r.Key}",-32} {r.HealthReason ?? "(nothing reported)"}");
+    if (state.Resources.Count == 0) Console.WriteLine("  (none declared)");
+
+    Console.WriteLine();
+    Console.WriteLine("DESIRED STATE");
+    foreach (var p in state.Policies)
+        Console.WriteLine($"  {(p.Enabled ? " " : "~")} {p.Name,-32} {p.Target.Describe(),-22} " +
+                          $"{p.Expectation.Describe()} -> {p.Remediation.Action.ToWire()}");
+    if (state.Policies.Count == 0) Console.WriteLine("  (no policies)");
+
+    Console.WriteLine();
+    Console.WriteLine("NEEDS INTERVENTION");
+    foreach (var i in state.ActiveIncidents) RenderIncidentLine(i);
+    if (state.ActiveIncidents.Count == 0) Console.WriteLine("  (nothing diverging)");
+
+    if (state.PendingApprovals.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("AWAITING YOUR APPROVAL");
+        foreach (var a in state.PendingApprovals)
+            Console.WriteLine($"  {a.Kind.ToWire(),-16} {a.Id}  {a.Reason}");
+        Console.WriteLine("  approve with: relay approve <action-id>");
+    }
+    return 0;
+}
+
+async Task<int> ObserveCommand()
+{
+    var project = Take() ?? throw Usage("`observe <project> <kind>/<key> <state>` requires a project");
+    var target = Take() ?? throw Usage("`observe` requires a <kind>/<key> target, e.g. service/api");
+    var rawState = Take() ?? throw Usage("`observe` requires a state: healthy | degraded | unavailable");
+
+    var slash = target.IndexOf('/');
+    if (slash <= 0) throw Usage($"target '{target}' must look like service/api");
+
+    var facts = new Dictionary<string, string>();
+    string signal = Observation.DefaultSignal, source = "cli", message = "";
+    DateTimeOffset? observedAt = null;
+    while (argsList.Count > 0)
+    {
+        var arg = Take()!;
+        switch (arg)
+        {
+            case "--signal": signal = Take() ?? signal; break;
+            case "--source": source = Take() ?? source; break;
+            case "--message": message = Take() ?? message; break;
+            case "--observed-at":
+                observedAt = DateTimeOffset.TryParse(Take(), out var at) ? at : null;
+                break;
+            case "--fact":
+                var kv = (Take() ?? "").Split('=', 2);
+                if (kv.Length == 2) facts[kv[0]] = kv[1];
+                break;
+            default: Console.Error.WriteLine($"Ignoring unknown option '{arg}'"); break;
+        }
+    }
+
+    using var http = Http(server);
+    var response = await http.PostAsJsonAsync($"/api/projects/{project}/observations", new ReportObservationRequest
+    {
+        Kind = EnumWire.ParseResourceKind(target[..slash]),
+        Key = target[(slash + 1)..],
+        Signal = signal,
+        State = ObservedStateWire.Parse(rawState),
+        Facts = facts.Count == 0 ? null : facts,
+        Source = source,
+        Message = string.IsNullOrEmpty(message) ? null : message,
+        ObservedAt = observedAt,
+    }, Json.Default);
+
+    if (!response.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"observation refused ({(int)response.StatusCode}): {await response.Content.ReadAsStringAsync()}");
+        return 1;
+    }
+    Console.WriteLine($"recorded: {target} {signal}={rawState}");
+    return 0;
+}
+
+async Task<int> IncidentsCommand()
+{
+    string? project = null;
+    var all = false;
+    while (argsList.Count > 0)
+    {
+        var arg = Take()!;
+        if (arg == "--project") project = Take();
+        else if (arg is "--all" or "-a") all = true;
+        else Console.Error.WriteLine($"Ignoring unknown option '{arg}'");
+    }
+
+    using var http = Http(server);
+    var query = $"/api/incidents?active={(all ? "false" : "true")}" + (project is null ? "" : $"&project={project}");
+    var incidents = await http.GetFromJsonAsync<List<Incident>>(query, Json.Default) ?? [];
+
+    foreach (var i in incidents) RenderIncidentLine(i);
+    if (incidents.Count == 0) Console.WriteLine(all ? "(no incidents)" : "(nothing requires intervention)");
+    return 0;
+}
+
+/// <summary>One incident with the evidence, the decisions and the verification behind it.</summary>
+async Task<int> IncidentCommand(string id)
+{
+    using var http = Http(server);
+    var response = await http.GetAsync($"/api/incidents/{id}");
+    if (!response.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"incident {id} not found");
+        return 1;
+    }
+    var detail = (await response.Content.ReadFromJsonAsync<IncidentDetail>(Json.Default))!;
+    var incident = detail.Incident;
+
+    Console.WriteLine($"{incident.ShortId}  {incident.Status.ToWire()}  ({incident.Severity.ToWire()})");
+    Console.WriteLine($"policy    : {incident.PolicyName}");
+    Console.WriteLine($"resource  : {incident.ResourceLabel}");
+    Console.WriteLine($"opened    : {incident.OpenedAt:u}");
+    Console.WriteLine($"observed  : {incident.Detail ?? incident.Summary}");
+    Console.WriteLine($"attempts  : {incident.Attempt}/{incident.MaxAttempts}");
+    if (incident.EscalationReason is { } esc) Console.WriteLine($"escalated : {esc}");
+    if (incident.Resolution is { } res) Console.WriteLine($"resolved  : {res} at {incident.ResolvedAt:u}");
+
+    if (detail.Actions.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("ACTIONS");
+        foreach (var a in detail.Actions)
+        {
+            Console.WriteLine($"  #{a.Attempt} {a.Kind.ToWire(),-16} {a.Status.ToWire(),-10} " +
+                              $"authorized by {a.ApprovedBy ?? "(pending)"}");
+            if (a.ExecutionJobId is { } jobId) Console.WriteLine($"     job      : {jobId}");
+            if (a.FailureReason is { } fr) Console.WriteLine($"     failure  : {fr}");
+            if (a.Outcome is { } outcome) Console.WriteLine($"     verified : {outcome.ToWire()} — {a.OutcomeDetail}");
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("TIMELINE");
+    foreach (var e in detail.Events)
+        Console.WriteLine($"  {e.CreatedAt:HH:mm:ss} {e.Kind,-12} {e.Message}");
+    return 0;
+}
+
+async Task<int> DecideCommand(string actionId, bool approve)
+{
+    string who = Environment.UserName, reason = "";
+    while (argsList.Count > 0)
+    {
+        var arg = Take()!;
+        if (arg is "--as" or "--by") who = Take() ?? who;
+        else if (arg == "--reason") reason = Take() ?? reason;
+        else Console.Error.WriteLine($"Ignoring unknown option '{arg}'");
+    }
+
+    using var http = Http(server);
+    var response = approve
+        ? await http.PostAsJsonAsync($"/api/actions/{actionId}/approve",
+            new ApproveActionRequest { ApprovedBy = who }, Json.Default)
+        : await http.PostAsJsonAsync($"/api/actions/{actionId}/reject",
+            new RejectActionRequest { RejectedBy = who, Reason = string.IsNullOrEmpty(reason) ? null : reason },
+            Json.Default);
+
+    if (!response.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"{(approve ? "approve" : "reject")} failed ({(int)response.StatusCode}): " +
+                                await response.Content.ReadAsStringAsync());
+        return 1;
+    }
+    Console.WriteLine(approve
+        ? $"approved; Relay will act on the next loop tick (as {who})"
+        : $"rejected; the incident is escalated to a human (as {who})");
+    return 0;
+}
+
+static void RenderIncidentLine(Incident i) =>
+    Console.WriteLine($"  {i.ShortId,-6} {i.Status.ToWire(),-18} {i.Severity.ToWire(),-8} " +
+                      $"{i.ResourceLabel,-24} {i.Detail ?? i.Summary}");
+
+static string Health(ResourceHealth health) => health switch
+{
+    ResourceHealth.Healthy => "ok  ",
+    ResourceHealth.Degraded => "warn",
+    ResourceHealth.Unavailable => "DOWN",
+    _ => "?   ",
+};
+
+// ---- execution plane ----
 
 /// <summary>Subscribes to the SSE stream until the job reaches a terminal state.</summary>
 async Task<int> FollowAsync(HttpClient http, string id)

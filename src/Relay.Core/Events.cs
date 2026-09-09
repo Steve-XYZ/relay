@@ -3,6 +3,10 @@ using System.Text.Json.Serialization;
 
 namespace Relay.Core;
 
+/// <summary>
+/// Kinds shared by the job log and the incident log. Both logs are append-only, densely
+/// sequenced per subject, and replayed over SSE, so they share one vocabulary.
+/// </summary>
 public enum EventKind
 {
     State,
@@ -12,7 +16,16 @@ public enum EventKind
     Warning,
     Milestone,
     Usage,
-    Error
+    Error,
+
+    /// <summary>Evidence Relay compared against desired state.</summary>
+    Observation,
+
+    /// <summary>A choice the loop made, and the authority it made it under.</summary>
+    Decision,
+
+    /// <summary>Whether an intervention demonstrably worked.</summary>
+    Verification,
 }
 
 public static class EventKindExtensions

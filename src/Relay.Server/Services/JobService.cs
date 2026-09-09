@@ -76,11 +76,22 @@ public sealed class JobService
     private static JobEvent[] TerminalEvent(JobStatus to) =>
         to.IsTerminal() ? [JobEvent.Milestone($"job_{to.ToWire()}")] : [];
 
+    /// <summary>
+    /// Completion is a state change like any other, so it appends the same
+    /// <c>validating -> completed</c> state event. Without it the durable log would disagree
+    /// with the row, and replaying the log — which is how the CLI, the web timeline and any
+    /// future consumer reconstruct a job — would never show the job finishing.
+    /// </summary>
     public async Task<Job?> CompleteAsync(Guid jobId, Guid leaseToken, JobResult result, Usage? usageFinal, CancellationToken ct)
     {
         var job = await _store.CompleteAsync(jobId, leaseToken, result, usageFinal, ct);
         if (job is null) return null;
-        await AppendEventsAsync(jobId, [JobEvent.Milestone("result_ready", job.Result?.Branch ?? ""), JobEvent.Milestone("job_completed")], ct);
+        await AppendEventsAsync(jobId,
+        [
+            JobEvent.State(JobStatus.Validating, JobStatus.Completed),
+            JobEvent.Milestone("result_ready", job.Result?.Branch ?? ""),
+            JobEvent.Milestone("job_completed"),
+        ], ct);
         RelayMetrics.JobsFinished.Add(1, KeyValuePair.Create<string, object?>("status", "completed"));
         return job;
     }

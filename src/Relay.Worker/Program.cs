@@ -47,17 +47,6 @@ if (!string.IsNullOrEmpty(otlpEndpoint))
 
 var host = builder.Build();
 
-var git = host.Services.GetRequiredService<GitWorkspace>();
-git.MilestoneEmitted += (_, m) => _ = Task.Run(async () =>
-{
-    try
-    {
-        await host.Services.GetRequiredService<WorkerLoop>().EmitMilestoneAsync(
-            m.JobId, m.Name, m.Detail, CancellationToken.None);
-    }
-    catch { /* event delivery is best-effort */ }
-});
-
 var opts = host.Services.GetRequiredService<IOptions<WorkerOptions>>().Value;
 Console.WriteLine($"relay-worker -> server {opts.ServerUrl}, sandbox mode {opts.SandboxMode}");
 host.Run();

@@ -3,12 +3,25 @@ using Relay.Core;
 
 namespace Relay.Worker;
 
+/// <summary>
+/// One job's checkout: the bare-ish clone, the linked worktree the agent edits, and the base
+/// commit the diff is taken against.
+///
+/// This is a value handed back by <see cref="GitWorkspace.PrepareAsync"/> rather than state on
+/// the workspace service. A worker runs many jobs in sequence, so per-job paths and — most
+/// importantly — the resolved base SHA must not outlive the job that produced them.
+/// </summary>
+public sealed record JobWorkspace(string OriginDir, string TreeDir, string BaseSha)
+{
+    public string Branch(Job job) => GitWorkspace.BranchPrefix + job.ShortId;
+}
+
 /// <summary>Git operations for job workspaces, executed with the git CLI (argv style).</summary>
 public sealed class GitWorkspace(ILogger<GitWorkspace> logger)
 {
     public const string BranchPrefix = "relay/";
 
-    private static readonly Dictionary<string, string> EmptyEnv = new()
+    private static readonly Dictionary<string, string> GitEnv = new()
     {
         // Commits must work even where the host has no global git identity.
         ["GIT_AUTHOR_NAME"] = "Relay",
@@ -17,79 +30,84 @@ public sealed class GitWorkspace(ILogger<GitWorkspace> logger)
         ["GIT_COMMITTER_EMAIL"] = "relay@localhost",
     };
 
-    public string OriginDir { get; private set; } = "";
-    public string TreeDir { get; private set; } = "";
-    public string? BaseSha { get; private set; }
-
-    /// <summary>Clones the repository (or reuses the existing clone) and creates/reuses the job worktree.</summary>
-    public async Task PrepareAsync(string workspaceRoot, Job job, CancellationToken ct)
+    /// <summary>
+    /// Clones the repository (or reuses the existing clone) and creates/reuses the job
+    /// worktree. Milestones go to the caller's callback, which owns the lease and can
+    /// therefore authorize the write.
+    /// </summary>
+    public async Task<JobWorkspace> PrepareAsync(
+        string workspaceRoot, Job job, Func<string, string, Task> milestone, CancellationToken ct)
     {
         var ws = Path.Combine(workspaceRoot, job.ShortId);
-        OriginDir = Path.Combine(ws, "origin");
-        TreeDir = Path.Combine(ws, "tree");
+        var originDir = Path.Combine(ws, "origin");
+        var treeDir = Path.Combine(ws, "tree");
         Directory.CreateDirectory(ws);
 
-        if (!Directory.Exists(Path.Combine(OriginDir, ".git")))
+        if (!Directory.Exists(Path.Combine(originDir, ".git")))
         {
             logger.LogInformation("[{Short}] cloning {Repo}", job.ShortId, job.RepoUrl);
-            await Git("clone", job.RepoUrl, "origin", cwd: ws);
-            EmitMilestone(job, "repo_cloned");
+            await Git(ws, "clone", job.RepoUrl, "origin");
+            await milestone("repo_cloned", job.RepoUrl);
         }
 
-        // Resolve the diff base once, before any agent edits exist.
-        if (BaseSha is null)
-            BaseSha = (await Capture("rev-parse", job.BaseRef, cwd: OriginDir)).Trim();
+        // Resolve the diff base before any agent edits exist, once per job.
+        var baseSha = (await Capture(originDir, "rev-parse", job.BaseRef)).Trim();
 
         var branch = BranchPrefix + job.ShortId;
         // In a linked worktree .git is a FILE pointing at the admin dir, not a directory.
-        var gitMeta = Path.Combine(TreeDir, ".git");
-        var worktreeExists = Directory.Exists(TreeDir) && (File.Exists(gitMeta) || Directory.Exists(gitMeta));
+        var gitMeta = Path.Combine(treeDir, ".git");
+        var worktreeExists = Directory.Exists(treeDir) && (File.Exists(gitMeta) || Directory.Exists(gitMeta));
 
         if (!worktreeExists)
         {
             // Recovery attempts can leave a branch registered without a live worktree.
-            await Git("worktree", "prune", cwd: OriginDir);
-            if (await TryVerifyBranch(branch, ct))
-                await Git("worktree", "add", TreeDir, branch, cwd: OriginDir);
+            await Git(originDir, "worktree", "prune");
+            if (await BranchExistsAsync(originDir, branch, ct))
+                await Git(originDir, "worktree", "add", treeDir, branch);
             else
-                await Git("worktree", "add", TreeDir, "-b", branch, job.BaseRef, cwd: OriginDir);
+                await Git(originDir, "worktree", "add", treeDir, "-b", branch, job.BaseRef);
         }
-        EmitMilestone(job, "workspace_created", $"worktree:{TreeDir}");
+
+        await milestone("workspace_created", $"worktree:{treeDir}");
+        return new JobWorkspace(originDir, treeDir, baseSha);
     }
 
-    public async Task CommitIfChangedAsync(Job job, CancellationToken ct)
+    public async Task<string?> CommitIfChangedAsync(JobWorkspace workspace, Job job, CancellationToken ct)
     {
-        var status = (await Capture("status", "--porcelain", cwd: TreeDir)).Trim();
+        var status = (await Capture(workspace.TreeDir, "status", "--porcelain")).Trim();
         if (status.Length == 0)
         {
             logger.LogInformation("[{Short}] no changes to commit", job.ShortId);
-            return;
+            return null;
         }
 
-        await Git("add", "-A", cwd: TreeDir);
-        var message = $"relay({job.ShortId}): {FirstLine(job.Prompt)}\n\nProduced by Relay job {job.ShortId} (attempt {job.Attempt}).";
-        await Git("commit", "-m", message, cwd: TreeDir);
-        EmitMilestone(job, "commit_created", BranchPrefix + job.ShortId);
+        await Git(workspace.TreeDir, "add", "-A");
+        var message = $"relay({job.ShortId}): {FirstLine(job.Prompt)}\n\n"
+                    + $"Produced by Relay job {job.ShortId} (attempt {job.Attempt}).";
+        await Git(workspace.TreeDir, "commit", "-m", message);
+        return (await Capture(workspace.TreeDir, "rev-parse", "HEAD")).Trim();
     }
 
-    public async Task<(string Stat, IReadOnlyList<string> Files)> DiffSummaryAsync(Job job, CancellationToken ct)
+    public async Task<(string Stat, IReadOnlyList<string> Files)> DiffSummaryAsync(
+        JobWorkspace workspace, CancellationToken ct)
     {
-        var baseRef = BaseSha ?? job.BaseRef;
-        var stat = (await Capture("diff", "--stat", baseRef, cwd: TreeDir)).Trim();
-        var files = (await Capture("diff", "--name-only", baseRef, cwd: TreeDir))
+        var stat = (await Capture(workspace.TreeDir, "diff", "--stat", workspace.BaseSha)).Trim();
+        var files = (await Capture(workspace.TreeDir, "diff", "--name-only", workspace.BaseSha))
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         return (stat, files);
     }
 
-    public async Task<string?> TryCreatePullRequestAsync(Job job, CancellationToken ct)
+    public async Task<string?> TryCreatePullRequestAsync(JobWorkspace workspace, Job job, CancellationToken ct)
     {
         var title = $"relay({job.ShortId}): {FirstLine(job.Prompt)}";
-        var body = $"Resolves task: **{job.Prompt}**\n\n- Relay job `{job.ShortId}` (attempt {job.Attempt})\n- Tests executed inside sandbox\n";
+        var body = $"Resolves task: **{job.Prompt}**\n\n"
+                 + $"- Relay job `{job.ShortId}` (attempt {job.Attempt})\n"
+                 + "- Tests executed inside sandbox\n";
         try
         {
             var result = await ProcessRunner.RunAsync("gh",
-                ["pr", "create", "--title", title, "--body", body, "--head", BranchPrefix + job.ShortId],
-                TreeDir, EmptyEnv, null, ct);
+                ["pr", "create", "--title", title, "--body", body, "--head", workspace.Branch(job)],
+                workspace.TreeDir, GitEnv, null, ct);
             return result.ExitCode == 0
                 ? result.Output.LastOrDefault(l => l.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                 : null;
@@ -101,47 +119,29 @@ public sealed class GitWorkspace(ILogger<GitWorkspace> logger)
         }
     }
 
-    private Task Git(string arg0, string? arg1 = null, string? arg2 = null, string? arg3 = null,
-        string? arg4 = null, string? arg5 = null, string? cwd = null)
-    {
-        var argv = new List<string>();
-        foreach (var a in new[] { arg0, arg1, arg2, arg3, arg4, arg5 })
-            if (a is not null) argv.Add(a);
-        return RunChecked(argv, cwd);
-    }
+    // ---- git plumbing ----
 
-    private async Task<string> Capture(string arg0, string? arg1 = null, string? arg2 = null, string? cwd = null)
-    {
-        var argv = new List<string>();
-        foreach (var a in new[] { arg0, arg1, arg2 })
-            if (a is not null) argv.Add(a);
-        var result = await RunChecked(argv, cwd);
-        return string.Join("\n", result.Output);
-    }
+    private Task<ProcessRunner.Result> Git(string cwd, params string[] argv) => RunChecked(argv, cwd);
+
+    private async Task<string> Capture(string cwd, params string[] argv) =>
+        string.Join("\n", (await RunChecked(argv, cwd)).Output);
 
     /// <summary>Returns true when the ref exists; never throws.</summary>
-    private async Task<bool> TryVerifyBranch(string branchName, CancellationToken ct)
+    private static async Task<bool> BranchExistsAsync(string originDir, string branch, CancellationToken ct)
     {
         var result = await ProcessRunner.RunAsync("git",
-            ["rev-parse", "--verify", "--quiet", branchName], OriginDir, EmptyEnv, null, ct);
+            ["rev-parse", "--verify", "--quiet", branch], originDir, GitEnv, null, ct);
         return result.ExitCode == 0;
     }
 
     private async Task<ProcessRunner.Result> RunChecked(IReadOnlyList<string> argv, string? cwd)
     {
-        var result = await ProcessRunner.RunAsync("git", argv, cwd, EmptyEnv,
+        var result = await ProcessRunner.RunAsync("git", argv, cwd, GitEnv,
             line => logger.LogDebug("[git] {Line}", line), CancellationToken.None);
         if (result.ExitCode != 0)
             throw new InvalidOperationException($"git {string.Join(' ', argv)} failed ({result.ExitCode}): {result.Tail}");
         return result;
     }
-
-    private void EmitMilestone(Job job, string name, string detail = "") =>
-        MilestoneEmitted?.Invoke(this, new MilestoneArgs(job.Id, name, detail));
-
-    public event EventHandler<MilestoneArgs>? MilestoneEmitted;
-
-    public sealed record MilestoneArgs(Guid JobId, string Name, string Detail);
 
     private static string FirstLine(string text) => text.Split('\n')[0].Trim();
 }
