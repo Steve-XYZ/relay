@@ -3,7 +3,7 @@ using Npgsql;
 using NpgsqlTypes;
 using Relay.Core;
 using Relay.Server.Data;
-using StateMachine = Relay.Core.StateMachine;
+
 
 namespace Relay.Server.Stores;
 
@@ -14,7 +14,7 @@ namespace Relay.Server.Stores;
 public sealed class PostgresJobStore : IJobStore
 {
     public const string JobColumns = """
-        id, short_id, title, repo_url, base_ref, prompt, agent, test_command, status,
+        id, short_id, project_id, origin, title, repo_url, base_ref, prompt, agent, test_command, status,
         budget, usage_tokens_in, usage_tokens_out, usage_cost_usd, usage_tool_calls, usage_retries,
         attempt, max_attempts, cancel_requested, failure_reason, result, resume_from_checkpoint,
         lease_expires_at, created_at, started_at, finished_at
@@ -39,37 +39,42 @@ public sealed class PostgresJobStore : IJobStore
     {
         var usage = new Usage
         {
-            TokensIn = r.GetInt64(10),
-            TokensOut = r.GetInt64(11),
-            CostUsd = r.GetDecimal(12),
-            ToolCalls = r.GetInt64(13),
-            Retries = r.GetInt64(14),
+            TokensIn = r.GetInt64(12),
+            TokensOut = r.GetInt64(13),
+            CostUsd = r.GetDecimal(14),
+            ToolCalls = r.GetInt64(15),
+            Retries = r.GetInt64(16),
         };
         return new Job
         {
             Id = r.GetGuid(0),
             ShortId = r.GetString(1),
-            Title = r.GetString(2),
-            RepoUrl = r.GetString(3),
-            BaseRef = r.GetString(4),
-            Prompt = r.GetString(5),
-            Agent = r.GetString(6),
-            TestCommand = r.IsDBNull(7) ? null : r.GetString(7),
-            Status = r.GetString(8),
-            Budget = r.IsDBNull(9) ? null : Json.Deserialize<Budget>(r.GetString(9)),
+            ProjectId = r.IsDBNull(2) ? null : r.GetGuid(2),
+            Origin = JobOriginWire.Parse(r.GetString(3)),
+            Title = r.GetString(4),
+            RepoUrl = r.GetString(5),
+            BaseRef = r.GetString(6),
+            Prompt = r.GetString(7),
+            Agent = r.GetString(8),
+            TestCommand = r.IsDBNull(9) ? null : r.GetString(9),
+            Status = r.GetString(10),
+            Budget = r.IsDBNull(11) ? null : Json.Deserialize<Budget>(r.GetString(11)),
             Usage = usage,
-            Attempt = r.GetInt32(15),
-            MaxAttempts = r.GetInt32(16),
-            CancelRequested = r.GetBoolean(17),
-            FailureReason = r.IsDBNull(18) ? null : r.GetString(18),
-            Result = r.IsDBNull(19) ? null : Json.Deserialize<JobResult>(r.GetString(19)),
-            ResumeFromCheckpoint = r.GetInt64(20),
-            LeaseExpiresAt = r.IsDBNull(21) ? null : ToDto(r.GetDateTime(21)),
-            CreatedAt = ToDto(r.GetDateTime(22)),
-            StartedAt = r.IsDBNull(23) ? null : ToDto(r.GetDateTime(23)),
-            FinishedAt = r.IsDBNull(24) ? null : ToDto(r.GetDateTime(24)),
+            Attempt = r.GetInt32(17),
+            MaxAttempts = r.GetInt32(18),
+            CancelRequested = r.GetBoolean(19),
+            FailureReason = r.IsDBNull(20) ? null : r.GetString(20),
+            Result = r.IsDBNull(21) ? null : Json.Deserialize<JobResult>(r.GetString(21)),
+            ResumeFromCheckpoint = r.GetInt64(22),
+            LeaseExpiresAt = r.IsDBNull(23) ? null : ToDto(r.GetDateTime(23)),
+            CreatedAt = ToDto(r.GetDateTime(24)),
+            StartedAt = r.IsDBNull(25) ? null : ToDto(r.GetDateTime(25)),
+            FinishedAt = r.IsDBNull(26) ? null : ToDto(r.GetDateTime(26)),
         };
     }
+
+    /// <summary>Index of the extra column FailAsync appends after <see cref="JobColumns"/>.</summary>
+    private const int FromStatusOrdinal = 27;
 
     internal static JobEvent MapEvent(NpgsqlDataReader r)
     {
@@ -96,13 +101,15 @@ public sealed class PostgresJobStore : IJobStore
     {
         await using var conn = await _db.OpenAsync(ct);
         string sql = $"""
-            INSERT INTO jobs (id, short_id, title, repo_url, base_ref, prompt, agent, test_command, budget, status)
-            VALUES (@id, @shortId, @title, @repoUrl, @baseRef, @prompt, @agent, @testCommand, @budget, 'queued')
+            INSERT INTO jobs (id, short_id, project_id, origin, title, repo_url, base_ref, prompt, agent, test_command, budget, status)
+            VALUES (@id, @shortId, @projectId, @origin, @title, @repoUrl, @baseRef, @prompt, @agent, @testCommand, @budget, 'queued')
             RETURNING {JobColumns}
             """;
         await using var cmd = Cmd(conn, sql);
         cmd.Parameters.AddWithValue("id", Guid.NewGuid());
         cmd.Parameters.AddWithValue("shortId", await GenerateShortId(conn, ct));
+        cmd.Parameters.AddWithValue("projectId", (object?)request.ProjectId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("origin", request.Origin.ToWire());
         cmd.Parameters.AddWithValue("title", request.Title ?? (request.Prompt.Length > 63 ? request.Prompt[..60] + "..." : request.Prompt));
         cmd.Parameters.AddWithValue("repoUrl", request.RepoUrl);
         cmd.Parameters.AddWithValue("baseRef", string.IsNullOrWhiteSpace(request.BaseRef) ? "HEAD" : request.BaseRef!);
@@ -118,13 +125,9 @@ public sealed class PostgresJobStore : IJobStore
 
     private static async Task<string> GenerateShortId(NpgsqlConnection conn, CancellationToken ct)
     {
-        const string alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-        var chars = new char[4];
         for (var i = 0; i < 16; i++)
         {
-            for (var j = 0; j < chars.Length; j++)
-                chars[j] = alphabet[Random.Shared.Next(alphabet.Length)];
-            var candidate = new string(chars);
+            var candidate = ShortId.Generate();
 
             using var check = Cmd(conn, "SELECT 1 FROM jobs WHERE short_id = @s");
             check.Parameters.AddWithValue("s", candidate);
@@ -336,7 +339,7 @@ public sealed class PostgresJobStore : IJobStore
             current = (string)found;
         }
 
-        if (!StateMachine.CanTransition(Wire.From(current), to)) return null;
+        if (!JobStateMachine.CanTransition(Wire.From(current), to)) return null;
 
         var sql = $"UPDATE jobs SET status = @to{(finish ? ", finished_at = now()" : "")}" +
                   (failureReason is null ? "" : ", failure_reason = @reason") +
@@ -474,7 +477,8 @@ public sealed class PostgresJobStore : IJobStore
                 finished_at = now(),
                 lease_worker = NULL, lease_token = NULL, lease_expires_at = NULL,
                 updated_at = now()
-            WHERE id = @id AND lease_token = @token AND status = 'validating'
+            WHERE id = @id AND lease_token = @token AND lease_expires_at > now()
+              AND status = 'validating'
             RETURNING {JobColumns}
             """;
         await using var cmd = Cmd(conn, sql);
@@ -509,7 +513,7 @@ public sealed class PostgresJobStore : IJobStore
         string sql = $"""
             WITH cur AS (
                 SELECT id, status FROM jobs
-                WHERE id = @id AND lease_token = @token
+                WHERE id = @id AND lease_token = @token AND lease_expires_at > now()
                   AND status IN ('preparing', 'running', 'validating')
                 FOR UPDATE
             )
@@ -544,7 +548,7 @@ public sealed class PostgresJobStore : IJobStore
         await using (var reader = await cmd.ExecuteReaderAsync(ct))
         {
             if (await reader.ReadAsync(ct))
-                outcome = (MapJob(reader), Wire.From(reader.GetString(25)));
+                outcome = (MapJob(reader), Wire.From(reader.GetString(FromStatusOrdinal)));
         }
         if (outcome is null) return null;
         await tx.CommitAsync(ct);

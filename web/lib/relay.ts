@@ -89,18 +89,39 @@ export async function cancelJob(idOrShort: string): Promise<boolean> {
   return res.ok;
 }
 
+/**
+ * Event kinds the server tags SSE frames with (Relay.Core `EventKind`, snake_case).
+ * Frames carry an `event:` line, so `EventSource.onmessage` — which only sees untagged
+ * frames — never fires for them and every kind has to be subscribed explicitly.
+ */
+export const EVENT_KINDS = [
+  "state",
+  "log",
+  "progress",
+  "checkpoint",
+  "warning",
+  "milestone",
+  "usage",
+  "error",
+  "observation",
+  "decision",
+  "verification",
+] as const;
+
 /** Subscribe to the SSE event stream; returns a cleanup function. */
 export function subscribeEvents(
   idOrShort: string,
   onEvent: (e: JobEventDto) => void,
 ): () => void {
   const es = new EventSource(`${RELAY_URL}/api/jobs/${idOrShort}/events`);
-  es.onmessage = (msg) => {
+  const handle = (msg: MessageEvent) => {
     try {
       onEvent(JSON.parse(msg.data));
     } catch {
       /* ignore malformed frames */
     }
   };
+  for (const kind of EVENT_KINDS) es.addEventListener(kind, handle);
+  es.onmessage = handle;
   return () => es.close();
 }

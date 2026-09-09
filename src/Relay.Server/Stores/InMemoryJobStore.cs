@@ -1,6 +1,4 @@
 using Relay.Core;
-using Relay.Server.Stores;
-using StateMachine = Relay.Core.StateMachine;
 
 namespace Relay.Server.Stores;
 
@@ -31,12 +29,14 @@ public sealed class InMemoryJobStore : IJobStore
     public Task<Job> CreateJobAsync(CreateJobRequest request, CancellationToken ct)
     {
         var now = _clock.GetUtcNow();
-            var prompt = request.Prompt;
-            var job = new Job
-            {
-                Id = Guid.NewGuid(),
-                ShortId = GenerateUniqueShortId(),
-                Title = request.Title ?? (prompt.Length > 63 ? prompt[..60] + "..." : prompt),
+        var prompt = request.Prompt;
+        var job = new Job
+        {
+            Id = Guid.NewGuid(),
+            ShortId = GenerateUniqueShortId(),
+            ProjectId = request.ProjectId,
+            Origin = request.Origin,
+            Title = request.Title ?? (prompt.Length > 63 ? prompt[..60] + "..." : prompt),
             RepoUrl = request.RepoUrl,
             BaseRef = string.IsNullOrWhiteSpace(request.BaseRef) ? "HEAD" : request.BaseRef!,
             Prompt = request.Prompt,
@@ -58,7 +58,7 @@ public sealed class InMemoryJobStore : IJobStore
         {
             for (var i = 0; i < 64; i++)
             {
-                var candidate = Job.GenerateShortId(Random.Shared);
+                var candidate = ShortId.Generate();
                 if (_jobs.Values.All(r => r.Job.ShortId != candidate))
                     return candidate;
             }
@@ -144,6 +144,10 @@ public sealed class InMemoryJobStore : IJobStore
             var now = _clock.GetUtcNow();
             if (!_jobs.TryGetValue(jobId, out var r)) return Task.FromResult<HeartbeatOutcome?>(null);
             if (r.LeaseToken != leaseToken || !IsLeaseActive(r, now)) return Task.FromResult<HeartbeatOutcome?>(null);
+            // Same guard as Postgres: a job the sweeper already moved out of execution must
+            // not be extendable, or a zombie could keep a recovered job's lease alive.
+            if (r.Job.Status is not ("preparing" or "running" or "validating"))
+                return Task.FromResult<HeartbeatOutcome?>(null);
 
             var usage = r.Job.Usage;
             if (usageDelta is not null) usage = usage + usageDelta;
@@ -156,7 +160,7 @@ public sealed class InMemoryJobStore : IJobStore
     private Job? TransitionLocked(Record r, JobStatus to, string? reason, bool requireLease, Guid? leaseToken)
     {
         var current = Wire.From(r.Job.Status);
-        if (!StateMachine.CanTransition(current, to)) return null;
+        if (!JobStateMachine.CanTransition(current, to)) return null;
         if (requireLease && (r.LeaseToken != leaseToken || !IsLeaseActive(r, _clock.GetUtcNow()))) return null;
 
         var now = _clock.GetUtcNow();
@@ -328,6 +332,7 @@ public sealed class InMemoryJobStore : IJobStore
                 var requeued = TransitionLocked(r, JobStatus.Queued, "requeued for recovery", false, null)!;
                 requeued = requeued with { ResumeFromCheckpoint = lastCp, LeaseExpiresAt = null };
                 r.Job = requeued;
+                r.LeaseToken = null;
                 transitions.Add(new SweepTransition(r.Job.Id, r.Job.ShortId, JobStatus.Recovering, JobStatus.Queued, "requeued for recovery"));
             }
         }

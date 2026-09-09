@@ -3,15 +3,15 @@ using Xunit;
 
 namespace Relay.Core.Tests;
 
-public class StateMachineTests
+public class JobStateMachineTests
 {
     [Fact]
     public void Happy_path_is_allowed()
     {
-        Assert.True(StateMachine.CanTransition(JobStatus.Queued, JobStatus.Preparing));
-        Assert.True(StateMachine.CanTransition(JobStatus.Preparing, JobStatus.Running));
-        Assert.True(StateMachine.CanTransition(JobStatus.Running, JobStatus.Validating));
-        Assert.True(StateMachine.CanTransition(JobStatus.Validating, JobStatus.Completed));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Queued, JobStatus.Preparing));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Preparing, JobStatus.Running));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Running, JobStatus.Validating));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Validating, JobStatus.Completed));
     }
 
     [Theory]
@@ -19,32 +19,32 @@ public class StateMachineTests
     [InlineData(JobStatus.Running, JobStatus.Interrupted)]
     [InlineData(JobStatus.Validating, JobStatus.Interrupted)]
     public void Crash_paths_lead_to_interrupted(JobStatus from, JobStatus to)
-        => Assert.True(StateMachine.CanTransition(from, to));
+        => Assert.True(JobStateMachine.CanTransition(from, to));
 
     [Fact]
     public void Interrupted_recovers_through_recovering()
     {
-        Assert.True(StateMachine.CanTransition(JobStatus.Interrupted, JobStatus.Recovering));
-        Assert.True(StateMachine.CanTransition(JobStatus.Recovering, JobStatus.Queued));
-        Assert.True(StateMachine.CanTransition(JobStatus.Recovering, JobStatus.Preparing));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Interrupted, JobStatus.Recovering));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Recovering, JobStatus.Queued));
+        Assert.True(JobStateMachine.CanTransition(JobStatus.Recovering, JobStatus.Preparing));
     }
 
     [Fact]
     public void Cannot_skip_states_or_resurrect_terminal_jobs()
     {
-        Assert.False(StateMachine.CanTransition(JobStatus.Queued, JobStatus.Completed));
-        Assert.False(StateMachine.CanTransition(JobStatus.Queued, JobStatus.Running));
-        Assert.False(StateMachine.CanTransition(JobStatus.Running, JobStatus.Queued));
-        Assert.False(StateMachine.CanTransition(JobStatus.Completed, JobStatus.Running));
-        Assert.False(StateMachine.CanTransition(JobStatus.Failed, JobStatus.Queued));
-        Assert.False(StateMachine.CanTransition(JobStatus.Cancelled, JobStatus.Queued));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Queued, JobStatus.Completed));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Queued, JobStatus.Running));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Running, JobStatus.Queued));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Completed, JobStatus.Running));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Failed, JobStatus.Queued));
+        Assert.False(JobStateMachine.CanTransition(JobStatus.Cancelled, JobStatus.Queued));
     }
 
     [Fact]
     public void Validate_throws_on_invalid_transition()
     {
         var ex = Assert.Throws<InvalidTransitionException>(
-            () => StateMachine.Validate(JobStatus.Queued, JobStatus.Completed));
+            () => JobStateMachine.Validate(JobStatus.Queued, JobStatus.Completed));
         Assert.Equal(JobStatus.Queued, ex.From);
         Assert.Equal(JobStatus.Completed, ex.To);
     }
@@ -54,7 +54,7 @@ public class StateMachineTests
     {
         foreach (var status in new[] { JobStatus.Completed, JobStatus.Failed, JobStatus.Cancelled })
         {
-            Assert.Empty(StateMachine.Next(status));
+            Assert.Empty(JobStateMachine.Next(status));
             Assert.True(status.IsTerminal());
         }
     }

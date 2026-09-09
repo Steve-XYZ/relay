@@ -3,6 +3,16 @@ using System.Text.Json.Serialization;
 
 namespace Relay.Core;
 
+/// <summary>
+/// Why a job exists. Policy-driven jobs are executions of a remediation action; user jobs
+/// are somebody asking Relay to do a piece of work directly.
+/// </summary>
+public enum JobOrigin
+{
+    User,
+    Policy,
+}
+
 public enum JobStatus
 {
     Queued,
@@ -98,6 +108,14 @@ public sealed record JobResult
     public string? TestsOutputTail { get; init; }
 }
 
+/// <summary>
+/// A unit of sandboxed execution: clone a repo, run an agent, validate, produce a diff.
+///
+/// A job is Relay's execution primitive, not its unit of meaning. Above it sit resources,
+/// policies, incidents and actions; a job is how one action gets carried out. It therefore
+/// knows its project but deliberately knows nothing about the incident that caused it —
+/// execution must stay replaceable without touching the control-plane model.
+/// </summary>
 public sealed record Job
 {
     [JsonPropertyName("id")]
@@ -106,6 +124,13 @@ public sealed record Job
     /// <summary>Human-friendly id used in URLs and CLI output, e.g. "7F2A".</summary>
     [JsonPropertyName("short_id")]
     public required string ShortId { get; init; }
+
+    /// <summary>Project this job belongs to; null for jobs created before a project existed.</summary>
+    [JsonPropertyName("project_id")]
+    public Guid? ProjectId { get; init; }
+
+    [JsonPropertyName("origin")]
+    public JobOrigin Origin { get; init; } = JobOrigin.User;
 
     [JsonPropertyName("title")]
     public string Title { get; init; } = "";
@@ -165,15 +190,14 @@ public sealed record Job
     [JsonPropertyName("lease_expires_at")]
     public DateTimeOffset? LeaseExpiresAt { get; init; }
 
-    public static string GenerateShortId(Random random)
-    {
-        const string alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-        Span<char> chars = stackalloc char[4];
-        lock (random)
-        {
-            for (var i = 0; i < chars.Length; i++)
-                chars[i] = alphabet[random.Next(alphabet.Length)];
-        }
-        return new string(chars);
-    }
+}
+
+public static class JobOriginWire
+{
+    public static string ToWire(this JobOrigin origin) => origin.ToString().ToLowerInvariant();
+
+    public static JobOrigin Parse(string value) =>
+        Enum.TryParse<JobOrigin>(value, ignoreCase: true, out var o)
+            ? o
+            : throw new DomainException($"unknown job origin '{value}'");
 }

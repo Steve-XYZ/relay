@@ -27,6 +27,14 @@ public interface IJobStore
     Task<HeartbeatOutcome?> HeartbeatAsync(
         Guid jobId, Guid leaseToken, TimeSpan extendBy, Usage? usageDelta, CancellationToken ct);
 
+    /// <summary>
+    /// True only while the presented token is the job's live lease. Every worker-originated
+    /// write is gated on this, including the ones that do not change status: a zombie worker
+    /// that could still append events or checkpoints would be able to corrupt the record a
+    /// recovered worker resumes from.
+    /// </summary>
+    Task<bool> HasValidLeaseAsync(Guid jobId, Guid leaseToken, CancellationToken ct);
+
     /// <summary>Validated transition performed while holding a live lease.</summary>
     Task<(Job Job, JobStatus From)?> TransitionWithLeaseAsync(Guid jobId, Guid leaseToken, JobStatus to, string? reason, CancellationToken ct);
 

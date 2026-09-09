@@ -23,13 +23,29 @@ if (!string.IsNullOrEmpty(otlpEndpoint))
         .AddOtlpExporter());
 }
 
+// Minimal APIs bind with their own serializer instance, so the shared contract has to be
+// applied to it explicitly or request bodies and stored JSON drift apart.
+builder.Services.ConfigureHttpJsonOptions(o => Relay.Core.Json.Configure(o.SerializerOptions));
+
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<SseHub>();
+
+// Execution plane: jobs, leases, crash recovery.
 builder.Services.AddSingleton<JobService>();
 builder.Services.AddHostedService<RecoverySweeper>();
 
+// Control plane: projects, resources, observations, policies, incidents, actions.
+builder.Services.AddSingleton<ProjectService>();
+builder.Services.AddSingleton<ActionDispatcher>();
+builder.Services.Configure<ReliabilityLoopOptions>(builder.Configuration.GetSection("ReliabilityLoop"));
+builder.Services.AddHostedService<ReliabilityLoop>();
+
 if (storageMode == "memory")
 {
-    builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
+    builder.Services.AddSingleton<IJobStore>(sp =>
+        new InMemoryJobStore(sp.GetRequiredService<TimeProvider>()));
+    builder.Services.AddSingleton<IControlPlaneStore>(sp =>
+        new InMemoryControlPlaneStore(sp.GetRequiredService<TimeProvider>()));
 }
 else
 {
@@ -37,6 +53,7 @@ else
         ?? throw new InvalidOperationException("ConnectionStrings:relay is required for postgres storage");
     builder.Services.AddSingleton<IDbConnectionFactory>(new NpgsqlConnectionFactory(connectionString));
     builder.Services.AddSingleton<IJobStore, PostgresJobStore>();
+    builder.Services.AddSingleton<IControlPlaneStore, PostgresControlPlaneStore>();
 }
 
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
@@ -54,11 +71,6 @@ builder.Services.AddOpenTelemetry()
 
 var app = builder.Build();
 
-if (!string.IsNullOrEmpty(otlpEndpoint))
-{
-    // OTLP exporter is wired through configuration; see docs/architecture.md.
-}
-
 app.UseCors();
 
 if (storageMode != "memory")
@@ -69,6 +81,7 @@ if (storageMode != "memory")
 }
 
 app.MapPublicApi();
+app.MapProjectsApi();
 app.MapInternalApi();
 
 app.Run();

@@ -7,7 +7,6 @@ using System.Text.RegularExpressions;
 using Relay.Core;
 using Relay.Worker.Sandbox;
 
-
 namespace Relay.Worker;
 
 public sealed class WorkerOptions
@@ -25,9 +24,14 @@ public sealed class WorkerOptions
 }
 
 /// <summary>
-/// Claims jobs and drives the QUEUED -> PREPARING -> RUNNING -> VALIDATING -> COMPLETED
-/// pipeline. The worker never writes durable state directly: everything goes through
-/// leased internal API calls, so a worker that dies mid-flight cannot corrupt the record.
+/// Disposable execution capacity. Claims jobs and drives the
+/// QUEUED -> PREPARING -> RUNNING -> VALIDATING -> COMPLETED pipeline.
+///
+/// The worker holds no durable state and never writes any: every mutation — transitions,
+/// events, checkpoints, usage, completion — is an HTTP call authorized by the lease token from
+/// its claim. A worker that dies mid-flight goes silent, its lease expires, and the server
+/// recovers the job. A worker that is merely slow discovers it lost the lease at its next
+/// heartbeat and stands down without touching anything.
 /// </summary>
 public sealed partial class WorkerLoop(
     IOptions<WorkerOptions> options,
@@ -44,7 +48,18 @@ public sealed partial class WorkerLoop(
         public required Guid Token { get; init; }
         public DateTimeOffset StartedUtc { get; init; } = DateTimeOffset.UtcNow;
         public long LastCheckpointToolCall { get; set; }
+
+        /// <summary>Usage observed but not yet shipped to the server. Reset on every heartbeat.</summary>
         public Usage PendingDelta { get; set; } = new();
+
+        /// <summary>
+        /// Everything this job has consumed across all attempts: the server-side total at claim
+        /// time plus whatever this attempt has seen. Budgets are metered against this, never
+        /// against the unshipped delta — that resets on every heartbeat, which would make a
+        /// token or cost budget unreachable no matter how much the agent spent.
+        /// </summary>
+        public Usage Cumulative { get; set; } = new();
+
         public StopReason Stop { get; set; }
         public string? StopDetail { get; set; }
         public readonly object Gate = new();
@@ -55,10 +70,6 @@ public sealed partial class WorkerLoop(
     private readonly WorkerOptions _options = options.Value;
 
     private HttpClient Client() => httpClientFactory.CreateClient("relay-worker");
-
-    /// <summary>Subscribed once; forwards workspace milestones into the durable event log.</summary>
-    private void OnGitMilestone(object? _, GitWorkspace.MilestoneArgs m) =>
-        _ = FireAndForget(() => EmitAsync(m.JobId, [JobEvent.Milestone(m.Name, m.Detail)], CancellationToken.None));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -105,7 +116,9 @@ public sealed partial class WorkerLoop(
 
     private async Task RunJobAsync(Job job, Guid token, CancellationToken ct)
     {
-        var state = new LeaseState { Job = job, Token = token };
+        // Seed the budget meter with what previous attempts already spent, so a job that keeps
+        // crashing cannot spend its budget again on every recovery.
+        var state = new LeaseState { Job = job, Token = token, Cumulative = job.Usage };
         logger.LogInformation("[{Short}] claimed (attempt {Attempt}, resume from checkpoint {Cp})",
             state.ShortId, job.Attempt, job.ResumeFromCheckpoint);
 
@@ -119,40 +132,43 @@ public sealed partial class WorkerLoop(
         ISandbox? sandbox = null;
         try
         {
-            git.MilestoneEmitted += (_, m) =>
-                _ = FireAndForget(() => EmitAsync(m.JobId, [JobEvent.Milestone(m.Name, m.Detail)], ct));
-
             // PREPARING: clone/worktree, start sandbox
-            await git.PrepareAsync(_options.WorkspaceRoot, job, ct);
-            await CheckpointAsync(state, "workspace_ready", new Dictionary<string, string> { ["worktree"] = git.TreeDir }, ct);
+            var workspace = await git.PrepareAsync(_options.WorkspaceRoot, job,
+                (name, detail) => EmitAsync(state, [JobEvent.Milestone(name, detail)], ct), ct);
+            await CheckpointAsync(state, "workspace_ready",
+                new Dictionary<string, string> { ["worktree"] = workspace.TreeDir }, ct);
 
             sandbox = CreateSandbox(job);
-            var env = BuildAgentEnvironment(job);
-            await sandbox.StartAsync(git.TreeDir, env, ct);
-            await EmitAsync(job.Id, [JobEvent.Milestone("sandbox_started", sandbox.GetType().Name)], ct);
+            await sandbox.StartAsync(workspace.TreeDir, BuildAgentEnvironment(job), ct);
+            await EmitAsync(state, [JobEvent.Milestone("sandbox_started", sandbox.GetType().Name)], ct);
 
-            await TransitionOrAbortAsync(state, JobStatus.Running, ct);
+            await TransitionOrAbortAsync(state, JobStatus.Running, null, ct);
             if (state.Stop != StopReason.None) return;
-            await EmitAsync(job.Id, [JobEvent.Milestone("agent_started")], ct);
+            await EmitAsync(state, [JobEvent.Milestone("agent_started")], ct);
 
             // RUNNING
             var exitCode = await sandbox.ExecAsync(ResolveAgentCommand(job), line => OnAgentLine(state, line), ct);
-            Console.WriteLine($"[{state.ShortId}] agent exited with code {exitCode}");
+            logger.LogInformation("[{Short}] agent exited with code {Code}", state.ShortId, exitCode);
 
             if (state.Stop == StopReason.LeaseLost)
             {
                 logger.LogWarning("[{Short}] lease lost mid-run; stopping without touching state", state.ShortId);
                 return;
             }
-            if (state.Stop == StopReason.AgentFailed && exitCode != 0)
+
+            // A crashed or erroring agent is a failed job. Nothing else sets this, so without
+            // it a non-zero exit would fall through to validation and could be reported as a
+            // success on whatever the agent happened to leave in the worktree.
+            if (state.Stop == StopReason.None && exitCode != 0)
             {
-                state.StopDetail ??= $"agent exited with code {exitCode}";
+                state.Stop = StopReason.AgentFailed;
+                state.StopDetail = $"agent exited with code {exitCode}";
             }
 
             switch (state.Stop)
             {
                 case StopReason.CancelRequested:
-                    await TerminalByLeaseAsync(state, JobStatus.Cancelled, "cancelled by user", ct);
+                    await TransitionOrAbortAsync(state, JobStatus.Cancelled, "cancelled by user", ct);
                     return;
                 case StopReason.BudgetExceeded:
                     await FailByLeaseAsync(state, state.StopDetail ?? "budget exceeded", ct);
@@ -163,46 +179,50 @@ public sealed partial class WorkerLoop(
             }
 
             // VALIDATING
-            if (!await ValidateAsync(state, sandbox, ct)) return;
+            var testsTail = await ValidateAsync(state, sandbox, ct);
+            if (testsTail is null) return;
 
             // finalize: commit + diff (+ optional PR)
-            var refreshed = await RefreshJobAsync(job.Id, ct) ?? job;
-            await git.CommitIfChangedAsync(refreshed, CancellationToken.None);
-            var (stat, files) = await git.DiffSummaryAsync(refreshed, CancellationToken.None);
-            await EmitAsync(job.Id, [JobEvent.Milestone("diff_ready", $"{files.Count} file(s)")], ct);
+            var commitSha = await git.CommitIfChangedAsync(workspace, job, CancellationToken.None);
+            if (commitSha is not null)
+                await EmitAsync(state, [JobEvent.Milestone("commit_created", workspace.Branch(job))], ct);
 
-            string? prUrl = _options.CreatePr ? await git.TryCreatePullRequestAsync(refreshed, CancellationToken.None) : null;
+            var (stat, files) = await git.DiffSummaryAsync(workspace, CancellationToken.None);
+            await EmitAsync(state, [JobEvent.Milestone("diff_ready", $"{files.Count} file(s)")], ct);
+
+            var prUrl = _options.CreatePr
+                ? await git.TryCreatePullRequestAsync(workspace, job, CancellationToken.None)
+                : null;
 
             // Ship any usage the last periodic tick missed before closing out.
             await TickAsync(state, CancellationToken.None);
 
             var result = new JobResult
             {
-                Branch = GitWorkspace.BranchPrefix + job.ShortId,
+                Branch = workspace.Branch(job),
                 DiffStat = stat,
                 ChangedFiles = files,
+                CommitSha = commitSha,
                 PrUrl = prUrl,
                 TestsPassed = true,
+                TestsOutputTail = testsTail,
             };
 
             var response = await Client().PostAsJsonAsync($"/internal/jobs/{job.Id}/complete",
                 new CompleteRequest { LeaseToken = state.Token, Result = result }, Json.Default, ct);
 
             if (response.IsSuccessStatusCode)
-            {
-                await EmitAsync(job.Id, [JobEvent.Milestone("result_ready")], ct);
                 LogCompletion(job, files.Count, result);
-            }
             else
-            {
-                logger.LogWarning("[{Short}] completion rejected ({Code}); job moved on without us", state.ShortId, response.StatusCode);
-            }
+                logger.LogWarning("[{Short}] completion rejected ({Code}); job moved on without us",
+                    state.ShortId, response.StatusCode);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // Worker shutdown mid-job: do nothing. The lease expires, the server marks the job
             // INTERRUPTED and requeues it. That is the recovery story working as designed.
-            logger.LogInformation("[{Short}] worker shutting down; server will recover the job via lease expiry", state.ShortId);
+            logger.LogInformation("[{Short}] worker shutting down; server will recover the job via lease expiry",
+                state.ShortId);
         }
         catch (Exception ex)
         {
@@ -218,30 +238,27 @@ public sealed partial class WorkerLoop(
         }
     }
 
-    public async Task EmitMilestoneAsync(Guid jobId, string name, string detail, CancellationToken ct) =>
-        await EmitAsync(jobId, [JobEvent.Milestone(name, detail)], ct);
-
-    private async Task<bool> ValidateAsync(LeaseState state, ISandbox sandbox, CancellationToken ct)
+    /// <summary>Runs the validation command. Returns the output tail, or null when the job is over.</summary>
+    private async Task<string?> ValidateAsync(LeaseState state, ISandbox sandbox, CancellationToken ct)
     {
-        await TransitionOrAbortAsync(state, JobStatus.Validating, ct);
-        if (state.Stop != StopReason.None) return false;
-        await EmitAsync(state.Job.Id, [JobEvent.Milestone("validation_started")], ct);
+        await TransitionOrAbortAsync(state, JobStatus.Validating, null, ct);
+        if (state.Stop != StopReason.None) return null;
+        await EmitAsync(state, [JobEvent.Milestone("validation_started")], ct);
 
-        var testCommand = ResolveTestCommand(state.Job);
         var output = new List<string>();
-        var exitCode = await sandbox.ExecAsync(testCommand, line => output.Add(line), ct);
+        var exitCode = await sandbox.ExecAsync(ResolveTestCommand(state.Job), line => output.Add(line), ct);
         var tail = string.Join("\n", output.TakeLast(30));
 
         if (exitCode != 0)
         {
-            await EmitAsync(state.Job.Id, [JobEvent.Error($"tests failed:\n{tail}")], ct);
+            await EmitAsync(state, [JobEvent.Error($"tests failed:\n{tail}")], ct);
             await FailByLeaseAsync(state, $"tests failed (exit {exitCode})", ct);
-            return false;
+            return null;
         }
 
         var lastLine = output.LastOrDefault(l => l.Length > 0) ?? "";
-        await EmitAsync(state.Job.Id, [JobEvent.Milestone("tests_passed", lastLine)], ct);
-        return true;
+        await EmitAsync(state, [JobEvent.Milestone("tests_passed", lastLine)], ct);
+        return tail;
     }
 
     // ---- agent output parsing ----
@@ -254,17 +271,24 @@ public sealed partial class WorkerLoop(
         if (progress.Success)
         {
             var n = long.Parse(progress.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
-            lock (state.Gate) state.PendingDelta += new Usage { ToolCalls = 1 };
+            RecordUsage(state, new Usage { ToolCalls = 1 });
 
             _ = FireAndForget(async () =>
             {
-                await EmitAsync(state.Job.Id,
-                    [new JobEvent { Seq = 0, Kind = EventKind.Progress.ToWire(), Message = line, Data = new Dictionary<string, string> { ["tool_call"] = n.ToString() } }],
+                await EmitAsync(state,
+                    [new JobEvent
+                    {
+                        Seq = 0,
+                        Kind = EventKind.Progress.ToWire(),
+                        Message = line,
+                        Data = new Dictionary<string, string> { ["tool_call"] = n.ToString() },
+                    }],
                     CancellationToken.None);
                 if (n >= state.LastCheckpointToolCall + 4)
                 {
                     state.LastCheckpointToolCall = n;
-                    await CheckpointAsync(state, $"tool_call_{n}", new Dictionary<string, string> { ["tool_call"] = n.ToString() }, CancellationToken.None);
+                    await CheckpointAsync(state, $"tool_call_{n}",
+                        new Dictionary<string, string> { ["tool_call"] = n.ToString() }, CancellationToken.None);
                 }
             });
         }
@@ -273,32 +297,44 @@ public sealed partial class WorkerLoop(
             var usageMatch = UsageRegex().Match(line);
             if (usageMatch.Success)
             {
-                lock (state.Gate) state.PendingDelta += new Usage
+                RecordUsage(state, new Usage
                 {
                     TokensIn = ParseLong(usageMatch.Groups["tin"].Value),
                     TokensOut = ParseLong(usageMatch.Groups["tout"].Value),
-                    CostUsd = decimal.TryParse(usageMatch.Groups["cost"].Value, System.Globalization.CultureInfo.InvariantCulture, out var c) ? c : 0m,
-                };
-                _ = FireAndForget(() => EmitAsync(state.Job.Id,
-                    [new JobEvent { Seq = 0, Kind = EventKind.Usage.ToWire(), Message = line }], CancellationToken.None));
+                    CostUsd = decimal.TryParse(usageMatch.Groups["cost"].Value,
+                        System.Globalization.CultureInfo.InvariantCulture, out var c) ? c : 0m,
+                });
+                _ = FireAndForget(() => EmitAsync(state,
+                    [new JobEvent { Seq = 0, Kind = EventKind.Usage.ToWire(), Message = line }],
+                    CancellationToken.None));
             }
             else
             {
-                _ = FireAndForget(() => EmitAsync(state.Job.Id, [JobEvent.Log(line)], CancellationToken.None));
+                _ = FireAndForget(() => EmitAsync(state, [JobEvent.Log(line)], CancellationToken.None));
             }
         }
 
         CheckBudget(state);
     }
 
+    /// <summary>Adds to both the unshipped delta and the cumulative total under one lock.</summary>
+    private static void RecordUsage(LeaseState state, Usage delta)
+    {
+        lock (state.Gate)
+        {
+            state.PendingDelta += delta;
+            state.Cumulative += delta;
+        }
+    }
+
     private void CheckBudget(LeaseState state)
     {
         if (state.Stop != StopReason.None) return;
-        Usage snapshot;
-        lock (state.Gate) snapshot = state.PendingDelta;
+        Usage total;
+        lock (state.Gate) total = state.Cumulative;
 
         var elapsed = DateTimeOffset.UtcNow - state.StartedUtc;
-        var verdict = BudgetMeter.Evaluate(snapshot, state.Job.Budget, elapsed);
+        var verdict = BudgetMeter.Evaluate(total, state.Job.Budget, elapsed);
         if (verdict.Exceeded)
         {
             state.Stop = StopReason.BudgetExceeded;
@@ -311,7 +347,7 @@ public sealed partial class WorkerLoop(
 
     /// <summary>
     /// Extends the lease periodically, shipping usage deltas. A rejected heartbeat means we are
-    /// a zombie worker (server reassigned the job): stop immediately without writing anything.
+    /// a zombie worker (the server reassigned the job): stop immediately without writing anything.
     /// </summary>
     private async Task HeartbeatLoopAsync(LeaseState state, CancellationToken ct)
     {
@@ -322,9 +358,7 @@ public sealed partial class WorkerLoop(
             await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
             await TickAsync(state, ct);
             while (await timer.WaitForNextTickAsync(ct))
-            {
                 await TickAsync(state, ct);
-            }
         }
         catch (OperationCanceledException) { /* normal exit */ }
     }
@@ -353,12 +387,13 @@ public sealed partial class WorkerLoop(
         if ((int)response.StatusCode == 409)
         {
             state.Stop = StopReason.LeaseLost;
-            logger.LogWarning("[{Short}] heartbeat rejected ({{Code}}); standing down", state.ShortId);
+            logger.LogWarning("[{Short}] heartbeat rejected (409); standing down", state.ShortId);
             return;
         }
         if (!response.IsSuccessStatusCode)
         {
             // Transient server fault: keep the pipeline alive, re-ship the delta next tick.
+            // Cumulative is untouched, so the budget meter does not lose the spend either.
             lock (state.Gate) state.PendingDelta += delta;
             logger.LogWarning("[{Short}] heartbeat error ({Code}); retrying", state.ShortId, response.StatusCode);
             return;
@@ -394,7 +429,7 @@ public sealed partial class WorkerLoop(
     private static bool IsMock(string agent) =>
         string.IsNullOrWhiteSpace(agent) || agent.Trim().Equals("mock", StringComparison.OrdinalIgnoreCase);
 
-    private Dictionary<string, string> BuildAgentEnvironment(Job job) => new()
+    private static Dictionary<string, string> BuildAgentEnvironment(Job job) => new()
     {
         ["PROMPT"] = job.Prompt,
         ["RESUME_FROM"] = job.ResumeFromCheckpoint.ToString(),
@@ -415,18 +450,11 @@ public sealed partial class WorkerLoop(
         return ActivatorUtilities.CreateInstance<DockerSandbox>(services, dockerOptions);
     }
 
-    private async Task<Job?> RefreshJobAsync(Guid jobId, CancellationToken ct)
-    {
-        var response = await Client().GetAsync($"/api/jobs/{jobId}", ct);
-        return response.IsSuccessStatusCode
-            ? await response.Content.ReadFromJsonAsync<Job>(Json.Default, ct)
-            : null;
-    }
-
-    private async Task TransitionOrAbortAsync(LeaseState state, JobStatus to, CancellationToken ct)
+    private async Task TransitionOrAbortAsync(LeaseState state, JobStatus to, string? reason, CancellationToken ct)
     {
         using var response = await Client().PostAsJsonAsync($"/internal/jobs/{state.Job.Id}/transition",
-            new TransitionRequest { LeaseToken = state.Token, To = to.ToWire() }, Json.Default, ct);
+            new TransitionRequest { LeaseToken = state.Token, To = to.ToWire(), Reason = reason },
+            Json.Default, ct);
         if (response.IsSuccessStatusCode) return;
 
         logger.LogWarning("[{Short}] transition to {To} rejected ({Code})",
@@ -442,9 +470,6 @@ public sealed partial class WorkerLoop(
         throw new InvalidOperationException($"transition to {to.ToWire()} failed with {(int)response.StatusCode}");
     }
 
-    private Task TerminalByLeaseAsync(LeaseState state, JobStatus status, string reason, CancellationToken ct) =>
-        TransitionOrAbortAsync(state, status, ct);
-
     private async Task FailByLeaseAsync(LeaseState state, string reason, CancellationToken ct)
     {
         logger.LogWarning("[{Short}] failing: {Reason}", state.ShortId, reason);
@@ -454,37 +479,43 @@ public sealed partial class WorkerLoop(
             logger.LogWarning("[{Short}] failure report rejected ({Code})", state.ShortId, response.StatusCode);
     }
 
-    private async Task EmitAsync(Guid jobId, IReadOnlyList<JobEvent> events, CancellationToken ct)
+    /// <summary>
+    /// Appends to the job's durable log. Carries the lease token like every other worker write:
+    /// the server rejects events from a worker that no longer owns the job, which is what stops
+    /// a zombie from narrating over the worker that replaced it.
+    /// </summary>
+    private async Task EmitAsync(LeaseState state, IReadOnlyList<JobEvent> events, CancellationToken ct)
     {
         try
         {
-            using var response = await Client().PostAsJsonAsync($"/internal/jobs/{jobId}/events",
-                new AppendEventsRequest { LeaseToken = Guid.Empty, Events = events }, Json.Default, ct);
+            using var response = await Client().PostAsJsonAsync($"/internal/jobs/{state.Job.Id}/events",
+                new AppendEventsRequest { LeaseToken = state.Token, Events = events }, Json.Default, ct);
+            if ((int)response.StatusCode == 409) state.Stop = StopReason.LeaseLost;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            logger.LogWarning(ex, "[{Short}] failed to emit events", jobId.ToString()[..8]);
+            logger.LogWarning(ex, "[{Short}] failed to emit events", state.ShortId);
         }
     }
 
-    private async Task CheckpointAsync(LeaseState state, string label, Dictionary<string, string>? data, CancellationToken ct)
+    private async Task CheckpointAsync(
+        LeaseState state, string label, Dictionary<string, string>? data, CancellationToken ct)
     {
         try
         {
             using var response = await Client().PostAsJsonAsync($"/internal/jobs/{state.Job.Id}/checkpoints",
                 new CheckpointRequest { LeaseToken = state.Token, Label = label, Data = data }, Json.Default, ct);
+            if ((int)response.StatusCode == 409) state.Stop = StopReason.LeaseLost;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "[{Short}] checkpoint {Label} failed", state.ShortId, label);
         }
     }
 
-    private void LogCompletion(Job job, int fileCount, JobResult result)
-    {
+    private void LogCompletion(Job job, int fileCount, JobResult result) =>
         logger.LogInformation("[{Short}] COMPLETED branch={Branch} files={Files} pr={Pr}",
             job.ShortId, result.Branch, fileCount, result.PrUrl ?? "(none)");
-    }
 
     [GeneratedRegex(@"\[relay:progress\]\s+tool_call\s+(\d+)")]
     private static partial Regex ProgressRegex();
@@ -492,8 +523,7 @@ public sealed partial class WorkerLoop(
     [GeneratedRegex(@"\[relay:usage\]\s+tokens_in=(?<tin>\d+)\s+tokens_out=(?<tout>\d+)(?:\s+cost_usd=(?<cost>[\d.]+))?")]
     private static partial Regex UsageRegex();
 
-    private static long ParseLong(string value) =>
-        long.TryParse(value, out var v) ? v : 0;
+    private static long ParseLong(string value) => long.TryParse(value, out var v) ? v : 0;
 
     private static Task FireAndForget(Func<Task> action) =>
         Task.Run(async () =>

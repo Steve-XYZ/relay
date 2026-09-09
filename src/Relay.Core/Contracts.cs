@@ -2,12 +2,20 @@ using System.Text.Json.Serialization;
 
 namespace Relay.Core;
 
-// ---- Public API contracts (clients -> server) ----
+// ---- Job API contracts (clients -> server) ----
 
 public sealed record CreateJobRequest
 {
     [JsonPropertyName("repo_url")]
     public required string RepoUrl { get; init; }
+
+    /// <summary>Owning project. Optional: a job can still be a standalone piece of work.</summary>
+    [JsonPropertyName("project_id")]
+    public Guid? ProjectId { get; init; }
+
+    /// <summary>Set by the action dispatcher for policy-driven work; clients leave it alone.</summary>
+    [JsonPropertyName("origin")]
+    public JobOrigin Origin { get; init; } = JobOrigin.User;
 
     [JsonPropertyName("prompt")]
     public required string Prompt { get; init; }

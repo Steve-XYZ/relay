@@ -4,11 +4,15 @@ namespace Relay.Core;
 /// Explicit, persisted job lifecycle. Every transition is validated here and persisted
 /// by the server; no other component may move a job between states.
 ///
+/// This is the execution layer. Incidents and actions have their own state machines
+/// (<see cref="IncidentStateMachine"/>, <see cref="ActionStateMachine"/>) that sit above it:
+/// a job is how an action gets carried out, not a reason for one.
+///
 ///   QUEUED -> PREPARING -> RUNNING -> VALIDATING -> COMPLETED
 ///   RUNNING/PREPARING/VALIDATING -> INTERRUPTED -> RECOVERING -> (QUEUED | PREPARING)
 ///   any non-terminal -> FAILED | CANCELLED
 /// </summary>
-public static class StateMachine
+public static class JobStateMachine
 {
     private static readonly Dictionary<JobStatus, HashSet<JobStatus>> Allowed = new()
     {

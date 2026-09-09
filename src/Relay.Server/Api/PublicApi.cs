@@ -5,7 +5,7 @@ using Relay.Server.Stores;
 
 namespace Relay.Server.Api;
 
-/// <summary>Public REST + SSE surface consumed by the CLI and web UI.</summary>
+/// <summary>Public REST + SSE surface for jobs, consumed by the CLI and web UI.</summary>
 public static class PublicApi
 {
     public static IEndpointRouteBuilder MapPublicApi(this IEndpointRouteBuilder app)
@@ -45,8 +45,12 @@ public static class PublicApi
             switch (result)
             {
                 case CancelResult.CancelledDirectly:
-                    var events = await jobs.AppendEventsAsync(job.Id,
-                        [JobEvent.State(JobStatus.Queued, JobStatus.Cancelled, "cancelled by user"), JobEvent.Milestone("job_cancelled")], ct);
+                    // The from-state is whatever the job was actually in (queued, interrupted
+                    // or recovering). Hardcoding one would make the durable log disagree with
+                    // the transitions it is supposed to be a record of.
+                    await jobs.AppendEventsAsync(job.Id,
+                        [JobEvent.State(Wire.From(job.Status), JobStatus.Cancelled, "cancelled by user"),
+                         JobEvent.Milestone("job_cancelled")], ct);
                     return Results.Ok(await store.ResolveAsync(idOrShortId, ct));
                 case CancelResult.MarkRequested:
                     await jobs.AppendEventsAsync(job.Id,
@@ -66,62 +70,15 @@ public static class PublicApi
             var job = await store.ResolveAsync(idOrShortId, ct);
             if (job is null) return Results.NotFound();
 
-            long cursor = afterSeq ?? ParseLastEventId(http.Request) ?? 0;
-
-            http.Response.Headers.ContentType = "text/event-stream";
-            http.Response.Headers.CacheControl = "no-cache";
-            http.Response.Headers["X-Accel-Buffering"] = "no";
-
+            var cursor = afterSeq ?? SseStream.ParseLastEventId(http.Request) ?? 0;
             var history = await store.GetEventsAsync(job.Id, cursor, 10_000, ct);
-            foreach (var e in history)
-            {
-                await http.Response.WriteAsync(SseFormat.Frame(e), ct);
-                cursor = e.Seq;
-            }
-            await http.Response.Body.FlushAsync(ct);
 
-            using var subscription = sse.Subscribe(job.Id, out var reader);
-            var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            try
-            {
-                while (true)
-                {
-                    var readTask = reader.WaitToReadAsync(heartbeatCts.Token).AsTask();
-                    var idleTask = Task.Delay(TimeSpan.FromSeconds(15), heartbeatCts.Token);
-
-                    if (await Task.WhenAny(readTask, idleTask) == readTask)
-                    {
-                        if (!await readTask) break;
-                        while (reader.TryRead(out var frame))
-                            await http.Response.WriteAsync(frame, ct);
-                    }
-                    else
-                    {
-                        // Comment line keeps proxies from closing an idle stream.
-                        await http.Response.WriteAsync(": ping\n\n", ct);
-                    }
-                    await http.Response.Body.FlushAsync(ct);
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested || !http.RequestAborted.IsCancellationRequested)
-            {
-                // client disconnected or server shutting down
-            }
-            finally
-            {
-                heartbeatCts.Dispose();
-            }
+            await SseStream.RunAsync(http, sse, job.Id, history.Select(SseFormat.Frame).ToList(), ct);
             return Results.Empty;
         });
 
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
         return app;
-    }
-
-    private static long? ParseLastEventId(HttpRequest request)
-    {
-        if (!request.Headers.TryGetValue("Last-Event-ID", out var values)) return null;
-        return long.TryParse(values.LastOrDefault(), out var id) ? id : null;
     }
 }
