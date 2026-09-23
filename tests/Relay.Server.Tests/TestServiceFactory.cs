@@ -86,6 +86,7 @@ public static class TestFixtures
             Severity = Severity.Critical,
         }, CancellationToken.None);
 
+
     public static Expectation HealthyExpectation => new() { Kind = ExpectationKind.Healthy };
 
     public static Remediation AgentTask(
@@ -97,6 +98,17 @@ public static class TestFixtures
         RequiresApproval = requiresApproval,
         MaxAttempts = maxAttempts,
         CooldownSeconds = cooldownSeconds,
+        VerifyWithinSeconds = verifyWithinSeconds,
+    };
+
+    public static Remediation RunCommand(
+        string command = "true", bool requiresApproval = false, int maxAttempts = 1,
+        long verifyWithinSeconds = 120) => new()
+    {
+        Action = ActionKind.RunCommand,
+        Params = new Dictionary<string, string> { ["command"] = command },
+        RequiresApproval = requiresApproval,
+        MaxAttempts = maxAttempts,
         VerifyWithinSeconds = verifyWithinSeconds,
     };
 

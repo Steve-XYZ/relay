@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS policies (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS policies_project_name_idx ON policies (project_id, name);
 CREATE INDEX IF NOT EXISTS policies_project_idx ON policies (project_id) WHERE enabled;
 
 CREATE TABLE IF NOT EXISTS incidents (

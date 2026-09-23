@@ -240,8 +240,9 @@ get the incident's evidence appended to the policy author's prompt, clearly deli
 ## What is deliberately not here yet
 
 * Real LLM-agent adapters beyond the shell template (mock only today).
-* Action kinds beyond `notify` and `run_agent_task`. Restarts and deploys belong to systems
-  Relay should call, and each needs its own verification story before it earns an enum member.
+* Action kinds beyond `notify`, `run_agent_task` and `run_command`. Restarts and deploys
+  belong to systems Relay should call, and each needs its own verification story before it
+  earns an enum member.
 * Observation ingest is push-only: no pollers, no scrapers, no integrations.
 * The web dashboard still shows jobs only; the control plane is CLI and API today.
 * No authentication between clients and the server.

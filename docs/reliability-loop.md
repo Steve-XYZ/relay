@@ -65,6 +65,9 @@ terminal state, settle the action (`succeeded` for a completed job, `failed` oth
 job machinery guarantees terminality — leases expire, recovery requeues, attempts run out —
 so an incident can never be stuck here waiting on a job that will never answer.
 
+For `run_command`, the command runs synchronously during dispatch: exit 0 settles the action
+as succeeded with no job; non-zero exit or timeout settles it as failed (undispatchable).
+
 Once the action is `succeeded`: a verifiable remediation enters `verifying`; `notify` records
 `ActionOutcome.NotApplicable` and escalates, because telling a human has no observable effect
 on the resource and pretending to verify it would be a lie.

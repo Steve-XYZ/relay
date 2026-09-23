@@ -105,7 +105,8 @@ grant something, Relay escalates to a human instead of improvising:
 
 Both records are validated at write time (`Expectation.Validated()`,
 `Remediation.Validated()`), so a half-formed policy cannot reach the loop. An agent task
-with no prompt is rejected when it is authored, not discovered during an outage.
+with no prompt is rejected when it is authored, not discovered during an outage. Same for
+`run_command` with no `command` param.
 
 ## Incident
 
@@ -135,6 +136,7 @@ this*.
 | --- | --- |
 | `notify` | records that a human must intervene, with the incident's evidence attached |
 | `run_agent_task` | runs a coding agent against a repository, through the job runtime |
+| `run_command` | runs a short shell command synchronously (restart, requeue); exit 0 = it ran |
 
 Relay does not restart your containers or run your deploys. Where an intervention belongs to
 an external system, the honest design is to ask that system and then verify the result — so
