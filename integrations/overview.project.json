@@ -37,7 +37,7 @@
       "remediation": {
         "action": "run_command",
         "params": {
-          "command": "cd /Users/stive/.t3/worktrees/OverView/t3code-363ff4aa && npm run overview",
+          "command": ": ${OVERVIEW_ROOT:?set OVERVIEW_ROOT to the Overview checkout}; cd \"$OVERVIEW_ROOT\" && npm run overview",
           "timeout_seconds": "60"
         },
         "max_attempts": 2,
@@ -56,7 +56,7 @@
       "remediation": {
         "action": "run_command",
         "params": {
-          "command": "cd /Users/stive/.t3/worktrees/OverView/t3code-363ff4aa && npm run sync",
+          "command": ": ${OVERVIEW_ROOT:?set OVERVIEW_ROOT to the Overview checkout}; cd \"$OVERVIEW_ROOT\" && npm run sync",
           "timeout_seconds": "120"
         },
         "max_attempts": 2,

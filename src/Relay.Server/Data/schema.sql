@@ -60,6 +60,32 @@ CREATE TABLE IF NOT EXISTS policies (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Existing databases permitted duplicate (project_id, name) rows, which would fail
+-- the unique index below. Reconcile them first: keep the earliest row per
+-- (project_id, name), repoint its incidents, then delete the rest. Idempotent:
+-- a second run finds no duplicates and changes nothing.
+WITH ranked AS (
+    SELECT id, project_id, name,
+           ROW_NUMBER() OVER (PARTITION BY project_id, name ORDER BY created_at, id) AS rn
+    FROM policies
+),
+keepers AS (
+    SELECT project_id, name, id AS keep_id FROM ranked WHERE rn = 1
+)
+UPDATE incidents SET policy_id = keepers.keep_id
+FROM policies dup, keepers
+WHERE incidents.policy_id = dup.id
+  AND dup.project_id = keepers.project_id
+  AND dup.name = keepers.name
+  AND dup.id <> keepers.keep_id;
+
+WITH ranked AS (
+    SELECT id,
+           ROW_NUMBER() OVER (PARTITION BY project_id, name ORDER BY created_at, id) AS rn
+    FROM policies
+)
+DELETE FROM policies WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+
 CREATE UNIQUE INDEX IF NOT EXISTS policies_project_name_idx ON policies (project_id, name);
 CREATE INDEX IF NOT EXISTS policies_project_idx ON policies (project_id) WHERE enabled;
 

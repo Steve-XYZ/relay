@@ -38,6 +38,7 @@ builder.Services.AddHostedService<RecoverySweeper>();
 builder.Services.AddSingleton<ProjectService>();
 builder.Services.AddSingleton<ActionDispatcher>();
 builder.Services.Configure<ReliabilityLoopOptions>(builder.Configuration.GetSection("ReliabilityLoop"));
+builder.Services.Configure<RunCommandOptions>(builder.Configuration.GetSection("RunCommand"));
 builder.Services.AddHostedService<ReliabilityLoop>();
 
 if (storageMode == "memory")

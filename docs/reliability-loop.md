@@ -67,6 +67,10 @@ so an incident can never be stuck here waiting on a job that will never answer.
 
 For `run_command`, the command runs synchronously during dispatch: exit 0 settles the action
 as succeeded with no job; non-zero exit or timeout settles it as failed (undispatchable).
+Both stdout and stderr are drained concurrently so verbose output cannot deadlock the wait.
+`run_command` policies are rejected by the API unless the server opts in with
+`RunCommand:Enabled=true` — the API has no auth, so enabling it is remote shell execution
+for anyone who can reach the server. Enable only on a trusted network (loopback demo).
 
 Once the action is `succeeded`: a verifiable remediation enters `verifying`; `notify` records
 `ActionOutcome.NotApplicable` and escalates, because telling a human has no observable effect

@@ -421,10 +421,15 @@ async Task<int> ApplyCommand()
         return 1;
     }
 
+    // The upsert normalizes slugs ("Widget API" -> "widget-api"): use the canonical
+    // slug for every follow-up request so apply works with any valid input.
+    var created = await project.Content.ReadFromJsonAsync<Project>(Json.Default);
+    var slug = created?.Slug ?? config.Project.Slug;
+
     var resources = config.Resources ?? [];
     foreach (var r in resources)
     {
-        var response = await http.PostAsJsonAsync($"/api/projects/{config.Project.Slug}/resources",
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/resources",
             new UpsertResourceRequest
             {
                 Kind = r.Kind,
@@ -442,7 +447,7 @@ async Task<int> ApplyCommand()
     var policies = config.Policies ?? [];
     foreach (var p in policies)
     {
-        var response = await http.PostAsJsonAsync($"/api/projects/{config.Project.Slug}/policies", p, Json.Default);
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/policies", p, Json.Default);
         if (!response.IsSuccessStatusCode)
         {
             Console.Error.WriteLine($"policy '{p.Name}' failed: {await response.Content.ReadAsStringAsync()}");
@@ -450,7 +455,7 @@ async Task<int> ApplyCommand()
         }
     }
 
-    Console.WriteLine($"applied {config.Project.Slug}: {resources.Count} resource(s), {policies.Count} polic(ies)");
+    Console.WriteLine($"applied {slug}: {resources.Count} resource(s), {policies.Count} polic(ies)");
     return 0;
 }
 
@@ -465,18 +470,38 @@ async Task<int> ReportCommand()
     using var http = Http(server);
     using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
 
+    // Normalize locally so report targets the same slug the upsert created.
+    string slug;
+    try
+    {
+        slug = Project.NormalizeSlug(config.Project.Slug);
+    }
+    catch (DomainException ex)
+    {
+        Console.Error.WriteLine($"invalid project slug: {ex.Message}");
+        return 1;
+    }
+
     var reported = 0;
+    var failed = 0;
     foreach (var r in config.Resources ?? [])
     {
         ObservedState state;
         string? message = null;
         string source = "report";
 
-        if (!string.IsNullOrWhiteSpace(r.Url))
+        // The dashboard URL may be declared as a top-level `url` or inside
+        // `attributes.url` (as in integrations/overview.project.json): probe either.
+        var probeUrl = !string.IsNullOrWhiteSpace(r.Url)
+            ? r.Url
+            : r.Attributes is not null && r.Attributes.TryGetValue("url", out var attrUrl)
+                && !string.IsNullOrWhiteSpace(attrUrl) ? attrUrl : null;
+
+        if (!string.IsNullOrWhiteSpace(probeUrl))
         {
             try
             {
-                var resp = await probe.GetAsync(r.Url);
+                var resp = await probe.GetAsync(probeUrl);
                 state = resp.IsSuccessStatusCode ? ObservedState.Healthy : ObservedState.Degraded;
                 if (!resp.IsSuccessStatusCode) message = $"HTTP {(int)resp.StatusCode}";
             }
@@ -486,13 +511,20 @@ async Task<int> ReportCommand()
                 message = ex.Message;
             }
         }
+        else if (r.Kind == ResourceKind.Service)
+        {
+            // Never report a service as healthy without probing it: that would
+            // conceal an outage and could satisfy verification incorrectly.
+            Console.Error.WriteLine($"skip {r.Kind.ToWire()}/{r.Key}: no url to probe");
+            continue;
+        }
         else
         {
             // No probe target: report as healthy with no message (config-only resources).
             state = ObservedState.Healthy;
         }
 
-        var response = await http.PostAsJsonAsync($"/api/projects/{config.Project.Slug}/observations",
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/observations",
             new ReportObservationRequest
             {
                 Kind = r.Kind,
@@ -503,11 +535,15 @@ async Task<int> ReportCommand()
                 Message = message,
             }, Json.Default);
         if (response.IsSuccessStatusCode) reported++;
-        else Console.Error.WriteLine($"observation {r.Kind.ToWire()}/{r.Key} refused: {await response.Content.ReadAsStringAsync()}");
+        else
+        {
+            failed++;
+            Console.Error.WriteLine($"observation {r.Kind.ToWire()}/{r.Key} refused: {await response.Content.ReadAsStringAsync()}");
+        }
     }
 
-    Console.WriteLine($"reported {reported} observation(s) for {config.Project.Slug}");
-    return 0;
+    Console.WriteLine($"reported {reported} observation(s) for {slug}");
+    return failed > 0 ? 1 : 0;
 }
 
 async Task<int> IncidentsCommand()

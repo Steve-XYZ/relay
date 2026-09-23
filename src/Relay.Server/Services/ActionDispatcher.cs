@@ -18,6 +18,17 @@ public sealed record DispatchOutcome(bool Started, Guid? ExecutionJobId, string?
 }
 
 /// <summary>
+/// Server-side gate for `run_command` policies. The API has no authentication, so
+/// arbitrary shell execution must be an explicit operator opt-in (local loopback demo),
+/// never a default. Disabled by default; enable only where the server binds to a
+/// trusted network.
+/// </summary>
+public sealed class RunCommandOptions
+{
+    public bool Enabled { get; set; }
+}
+
+/// <summary>
 /// Turns an authorized action into execution. One explicit branch per <see cref="ActionKind"/>
 /// rather than a registry: Relay only knows how to do a small number of things, and a new one
 /// should cost a code review, not a plugin.
@@ -82,6 +93,11 @@ public sealed class ActionDispatcher
             if (process is null)
                 return DispatchOutcome.Undispatchable("failed to start process");
 
+            // Drain both redirected pipes concurrently while the command runs: waiting
+            // for exit before reading can deadlock once either pipe fills.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             try
@@ -95,8 +111,12 @@ public sealed class ActionDispatcher
                     $"command timed out after {timeoutSeconds}s");
             }
 
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+
             if (process.ExitCode != 0)
-                return DispatchOutcome.Undispatchable($"command exited with code {process.ExitCode}");
+                return DispatchOutcome.Undispatchable(
+                    $"command exited with code {process.ExitCode}: {Truncate(stderr.Length > 0 ? stderr : stdout, 500)}");
 
             _logger.LogInformation("incident {Incident}: dispatched run_command", action.IncidentId);
             return DispatchOutcome.Running(null);
@@ -105,6 +125,13 @@ public sealed class ActionDispatcher
         {
             return DispatchOutcome.Undispatchable($"command failed to start: {ex.Message}");
         }
+    }
+
+    private static string Truncate(string value, int max)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        var flat = value.Replace('\n', ' ').Replace('\r', ' ').Trim();
+        return flat.Length <= max ? flat : flat[..max];
     }
 
     private async Task<DispatchOutcome> RunAgentTaskAsync(

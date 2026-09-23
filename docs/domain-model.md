@@ -136,7 +136,7 @@ this*.
 | --- | --- |
 | `notify` | records that a human must intervene, with the incident's evidence attached |
 | `run_agent_task` | runs a coding agent against a repository, through the job runtime |
-| `run_command` | runs a short shell command synchronously (restart, requeue); exit 0 = it ran |
+| `run_command` | runs a short shell command synchronously (restart, requeue); exit 0 = it ran. API creation requires `RunCommand:Enabled=true` (no auth — trusted network only) |
 
 Relay does not restart your containers or run your deploys. Where an intervention belongs to
 an external system, the honest design is to ask that system and then verify the result — so
