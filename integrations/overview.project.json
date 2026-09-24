@@ -1,0 +1,67 @@
+{
+  "project": {
+    "slug": "overview",
+    "name": "Overview"
+  },
+  "resources": [
+    {
+      "kind": "repository",
+      "key": "overview",
+      "attributes": {
+        "repo_url": "https://github.com/example/overview"
+      }
+    },
+    {
+      "kind": "service",
+      "key": "dashboard",
+      "name": "Overview dashboard",
+      "attributes": {
+        "url": "http://127.0.0.1:4317/api/health"
+      }
+    },
+    {
+      "kind": "scheduled_process",
+      "key": "collector",
+      "name": "Overview collector",
+      "attributes": {
+        "state_file": "~/.config/overview/collector-state.json"
+      }
+    }
+  ],
+  "policies": [
+    {
+      "name": "dashboard must be healthy",
+      "target": { "kind": "service", "key": "dashboard" },
+      "expectation": { "kind": "healthy" },
+      "severity": "critical",
+      "remediation": {
+        "action": "run_command",
+        "params": {
+          "command": ": ${OVERVIEW_ROOT:?set OVERVIEW_ROOT to the Overview checkout}; cd \"$OVERVIEW_ROOT\" && npm run overview",
+          "timeout_seconds": "60"
+        },
+        "max_attempts": 2,
+        "verify_within_seconds": 120
+      }
+    },
+    {
+      "name": "collector must stay fresh",
+      "target": { "kind": "scheduled_process", "key": "collector" },
+      "expectation": {
+        "kind": "fresh",
+        "signal": "last_run",
+        "max_age_seconds": 3600
+      },
+      "severity": "warning",
+      "remediation": {
+        "action": "run_command",
+        "params": {
+          "command": ": ${OVERVIEW_ROOT:?set OVERVIEW_ROOT to the Overview checkout}; cd \"$OVERVIEW_ROOT\" && npm run sync",
+          "timeout_seconds": "120"
+        },
+        "max_attempts": 2,
+        "verify_within_seconds": 180
+      }
+    }
+  ]
+}

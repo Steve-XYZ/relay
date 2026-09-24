@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Relay.Core;
 using Relay.Server.Services;
 using Relay.Server.Sse;
@@ -88,12 +89,20 @@ public static class ProjectsApi
 
         app.MapPost("/api/projects/{project}/policies", async (
             string project, CreatePolicyRequest request, IControlPlaneStore store,
-            ProjectService projects, CancellationToken ct) =>
+            ProjectService projects, IOptions<RunCommandOptions> runCommand, CancellationToken ct) =>
         {
             var found = await store.ResolveProjectAsync(project, ct);
             if (found is null) return Results.NotFound(new { error = $"unknown project '{project}'" });
             if (string.IsNullOrWhiteSpace(request.Name))
                 return Results.BadRequest(new { error = "name is required" });
+            // The API has no authentication: creating a run_command policy is remote
+            // code execution on the Relay host. Require an explicit server-side opt-in.
+            if (request.Remediation.Action == ActionKind.RunCommand && !runCommand.Value.Enabled)
+                return Results.BadRequest(new
+                {
+                    error = "run_command policies are disabled on this server (RunCommand:Enabled=false). " +
+                            "Enable only on a trusted network: anyone with API access can run shell commands.",
+                });
 
             var policy = await projects.CreatePolicyAsync(found.Id, request, ct);
             return Results.Ok(policy);

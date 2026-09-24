@@ -27,11 +27,13 @@ sleep 1
 
 mkdir -p /tmp/relay-logs
 
-# 2. Server
+# 2. Server (loopback only; run_command opt-in for the Overview demo — the API has
+# no auth, so never enable this on a network others can reach).
 (
   cd "$ROOT/src/Relay.Server/bin/Debug/net10.0"
   ConnectionStrings__relay="Host=localhost;Port=${PG_PORT};Database=relay;Username=relay;Password=relay" \
   ASPNETCORE_URLS="http://127.0.0.1:${SERVER_PORT}" \
+  RunCommand__Enabled="${RELAY_RUN_COMMAND_ENABLED:-true}" \
   nohup dotnet exec Relay.Server.dll > /tmp/relay-logs/server.log 2>&1 &
 )
 # 3. Worker (process sandbox for local dev; build relay-sandbox image + SANDBOX_MODE=docker for containers)

@@ -542,6 +542,62 @@ public class ReliabilityLoopTests
     }
 
     [Fact]
+    public async Task A_run_command_action_dispatches_synchronously_without_a_job()
+    {
+        // run_command is the intervention: no job, exit 0 settles it. Fresh healthy evidence
+        // after the action resolves as verified — the same freshness rule as agent tasks.
+        var cp = TestServiceFactory.CreateControlPlane();
+        var project = await ProjectAsync(cp);
+        var service = await ResourceAsync(cp, project, ResourceKind.Service, "api");
+        await PolicyAsync(cp, project, HealthyExpectation, TestFixtures.RunCommand("true"));
+
+        await ReportAsync(cp, project, service, ObservedState.Unavailable);
+        await cp.TickAsync();
+
+        // MaxStepsPerIncidentPerTick lets a null-job run_command dispatch, settle and enter
+        // verifying in one tick (the same multi-step path Notify uses to escalate at once).
+        var incident = await SingleIncidentAsync(cp);
+        Assert.Equal(IncidentStatus.Verifying, incident.Status);
+
+        var action = Assert.Single(await cp.Control.ListActionsAsync(incident.Id, default));
+        Assert.Equal(ActionKind.RunCommand, action.Kind);
+        Assert.Null(action.ExecutionJobId);
+
+        cp.Clock.Advance(TimeSpan.FromSeconds(5));
+        await ReportAsync(cp, project, service, ObservedState.Healthy);
+        await cp.TickAsync();
+
+        incident = await RefreshAsync(cp, incident);
+        Assert.Equal(IncidentStatus.Resolved, incident.Status);
+        Assert.Equal("verified", incident.Resolution);
+
+        var settled = await cp.Control.GetActionAsync(action.Id, default);
+        Assert.Equal(ActionStatus.Succeeded, settled!.Status);
+        Assert.Equal(ActionOutcome.Verified, settled.Outcome);
+    }
+
+    [Fact]
+    public async Task A_run_command_that_fails_fails_the_attempt()
+    {
+        var cp = TestServiceFactory.CreateControlPlane();
+        var project = await ProjectAsync(cp);
+        var service = await ResourceAsync(cp, project, ResourceKind.Service, "api");
+        await PolicyAsync(cp, project, HealthyExpectation, TestFixtures.RunCommand("false", maxAttempts: 1));
+
+        await ReportAsync(cp, project, service, ObservedState.Unavailable);
+        await cp.TickAsync();
+
+        var incident = await SingleIncidentAsync(cp);
+        var action = Assert.Single(await cp.Control.ListActionsAsync(incident.Id, default));
+        Assert.Equal(ActionKind.RunCommand, action.Kind);
+        Assert.Equal(ActionStatus.Failed, action.Status);
+        Assert.Contains("exited", action.FailureReason);
+
+        incident = await RefreshAsync(cp, incident);
+        Assert.Equal(IncidentStatus.Escalated, incident.Status);
+    }
+
+    [Fact]
     public async Task Project_state_answers_the_whole_question_in_one_read()
     {
         var cp = TestServiceFactory.CreateControlPlane();

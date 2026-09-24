@@ -145,6 +145,8 @@ public sealed record Remediation
 
     public const string PromptParam = "prompt";
     public const string RepoUrlParam = "repo_url";
+    public const string CommandParam = "command";
+    public const string TimeoutSecondsParam = "timeout_seconds";
 
     public Remediation Validated()
     {
@@ -157,6 +159,10 @@ public sealed record Remediation
         if (Action == ActionKind.RunAgentTask &&
             (!Params.TryGetValue(PromptParam, out var prompt) || string.IsNullOrWhiteSpace(prompt)))
             throw new DomainException($"run_agent_task remediation requires a '{PromptParam}' param");
+
+        if (Action == ActionKind.RunCommand &&
+            (!Params.TryGetValue(CommandParam, out var command) || string.IsNullOrWhiteSpace(command)))
+            throw new DomainException($"run_command remediation requires a '{CommandParam}' param");
 
         return this;
     }

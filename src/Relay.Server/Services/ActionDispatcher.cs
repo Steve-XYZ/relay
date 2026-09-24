@@ -18,6 +18,17 @@ public sealed record DispatchOutcome(bool Started, Guid? ExecutionJobId, string?
 }
 
 /// <summary>
+/// Server-side gate for `run_command` policies. The API has no authentication, so
+/// arbitrary shell execution must be an explicit operator opt-in (local loopback demo),
+/// never a default. Disabled by default; enable only where the server binds to a
+/// trusted network.
+/// </summary>
+public sealed class RunCommandOptions
+{
+    public bool Enabled { get; set; }
+}
+
+/// <summary>
 /// Turns an authorized action into execution. One explicit branch per <see cref="ActionKind"/>
 /// rather than a registry: Relay only knows how to do a small number of things, and a new one
 /// should cost a code review, not a plugin.
@@ -46,9 +57,82 @@ public sealed class ActionDispatcher
             // loop escalates the incident to a human straight after.
             ActionKind.Notify => Task.FromResult(DispatchOutcome.Running(null)),
             ActionKind.RunAgentTask => RunAgentTaskAsync(policy, incident, resource, action, ct),
+            ActionKind.RunCommand => RunCommandAsync(action, ct),
             _ => Task.FromResult(DispatchOutcome.Undispatchable(
                 $"no executor for action kind '{action.Kind.ToWire()}'")),
         };
+
+    /// <summary>
+    /// Synchronous short-command remediation (restart, requeue, etc.). No job: the command
+    /// is the intervention. Exit 0 means it ran; non-zero or timeout is undispatchable so
+    /// the attempt fails loudly rather than hanging. Whether it fixed anything is still
+    /// decided later by verification against fresh observations.
+    /// </summary>
+    private async Task<DispatchOutcome> RunCommandAsync(RemediationAction action, CancellationToken ct)
+    {
+        if (!action.Params.TryGetValue(Remediation.CommandParam, out var command) ||
+            string.IsNullOrWhiteSpace(command))
+            return DispatchOutcome.Undispatchable($"action has no '{Remediation.CommandParam}' param");
+
+        var timeoutSeconds = 60;
+        if (action.Params.TryGetValue(Remediation.TimeoutSecondsParam, out var rawTimeout) &&
+            int.TryParse(rawTimeout, out var parsed) && parsed > 0)
+            timeoutSeconds = parsed;
+
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "/bin/sh",
+                ArgumentList = { "-c", command },
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            if (process is null)
+                return DispatchOutcome.Undispatchable("failed to start process");
+
+            // Drain both redirected pipes concurrently while the command runs: waiting
+            // for exit before reading can deadlock once either pipe fills.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+            try
+            {
+                await process.WaitForExitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                return DispatchOutcome.Undispatchable(
+                    $"command timed out after {timeoutSeconds}s");
+            }
+
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+
+            if (process.ExitCode != 0)
+                return DispatchOutcome.Undispatchable(
+                    $"command exited with code {process.ExitCode}: {Truncate(stderr.Length > 0 ? stderr : stdout, 500)}");
+
+            _logger.LogInformation("incident {Incident}: dispatched run_command", action.IncidentId);
+            return DispatchOutcome.Running(null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return DispatchOutcome.Undispatchable($"command failed to start: {ex.Message}");
+        }
+    }
+
+    private static string Truncate(string value, int max)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        var flat = value.Replace('\n', ' ').Replace('\r', ' ').Trim();
+        return flat.Length <= max ? flat : flat[..max];
+    }
 
     private async Task<DispatchOutcome> RunAgentTaskAsync(
         Policy policy, Incident incident, Resource resource, RemediationAction action, CancellationToken ct)

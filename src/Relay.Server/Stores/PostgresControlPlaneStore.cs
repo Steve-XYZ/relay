@@ -377,9 +377,18 @@ public sealed class PostgresControlPlaneStore : IControlPlaneStore
         var expectation = request.Expectation.Validated();
         var remediation = request.Remediation.Validated();
 
+        // Idempotent by (project_id, name): re-applying a config updates in place so
+        // `relay apply` can be run repeatedly without duplicating policies.
         var policy = await QueryOneAsync($"""
             INSERT INTO policies (id, project_id, name, target, expectation, severity, remediation, enabled)
             VALUES (@id, @projectId, @name, @target, @expectation, @severity, @remediation, @enabled)
+            ON CONFLICT (project_id, name) DO UPDATE SET
+                target = EXCLUDED.target,
+                expectation = EXCLUDED.expectation,
+                severity = EXCLUDED.severity,
+                remediation = EXCLUDED.remediation,
+                enabled = EXCLUDED.enabled,
+                updated_at = now()
             RETURNING {PolicyColumns}
             """,
             cmd =>
@@ -393,7 +402,7 @@ public sealed class PostgresControlPlaneStore : IControlPlaneStore
                 AddJson(cmd, "remediation", remediation);
                 cmd.Parameters.AddWithValue("enabled", request.Enabled);
             }, MapPolicy, ct);
-        return policy ?? throw new InvalidOperationException("policy insert returned no row");
+        return policy ?? throw new InvalidOperationException("policy upsert returned no row");
     }
 
     public Task<Policy?> GetPolicyAsync(Guid policyId, CancellationToken ct) =>

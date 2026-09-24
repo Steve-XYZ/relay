@@ -37,6 +37,8 @@ switch (command)
     case "projects": return await ProjectsCommand();
     case "state": return await StateCommand(Take() ?? throw Usage("`state <project>` requires a project"));
     case "observe": return await ObserveCommand();
+    case "apply": return await ApplyCommand();
+    case "report": return await ReportCommand();
     case "incidents": return await IncidentsCommand();
     case "incident": return await IncidentCommand(Take() ?? throw Usage("`incident <id>` requires an incident id"));
     case "approve": return await DecideCommand(Take() ?? throw Usage("`approve <action-id>` requires an action id"), approve: true);
@@ -80,6 +82,10 @@ void PrintUsage()
         OBSERVE
           relay observe <project> <kind>/<key> healthy|degraded|unavailable
                         [--signal S] [--fact k=v] [--source S] [--message M]
+
+        CONFIG
+          relay apply <config.json>     declare project, resources, policies (idempotent)
+          relay report <config.json>    probe resources and push observations
 
         DECIDE
           relay approve <action-id> [--as NAME]
@@ -394,6 +400,152 @@ async Task<int> ObserveCommand()
     return 0;
 }
 
+async Task<int> ApplyCommand()
+{
+    var path = Take() ?? throw Usage("`apply <config.json>` requires a config file");
+    if (!File.Exists(path)) { Console.Error.WriteLine($"config not found: {path}"); return 1; }
+
+    var config = Json.Deserialize<ProjectConfig>(await File.ReadAllTextAsync(path));
+    if (config is null) { Console.Error.WriteLine("empty or invalid config"); return 1; }
+
+    using var http = Http(server);
+
+    var project = await http.PostAsJsonAsync("/api/projects", new UpsertProjectRequest
+    {
+        Slug = config.Project.Slug,
+        Name = config.Project.Name,
+    }, Json.Default);
+    if (!project.IsSuccessStatusCode)
+    {
+        Console.Error.WriteLine($"project upsert failed: {await project.Content.ReadAsStringAsync()}");
+        return 1;
+    }
+
+    // The upsert normalizes slugs ("Widget API" -> "widget-api"): use the canonical
+    // slug for every follow-up request so apply works with any valid input.
+    var created = await project.Content.ReadFromJsonAsync<Project>(Json.Default);
+    var slug = created?.Slug ?? config.Project.Slug;
+
+    var resources = config.Resources ?? [];
+    foreach (var r in resources)
+    {
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/resources",
+            new UpsertResourceRequest
+            {
+                Kind = r.Kind,
+                Key = r.Key,
+                Name = r.Name,
+                Attributes = r.Attributes,
+            }, Json.Default);
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.Error.WriteLine($"resource {r.Kind.ToWire()}/{r.Key} failed: {await response.Content.ReadAsStringAsync()}");
+            return 1;
+        }
+    }
+
+    var policies = config.Policies ?? [];
+    foreach (var p in policies)
+    {
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/policies", p, Json.Default);
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.Error.WriteLine($"policy '{p.Name}' failed: {await response.Content.ReadAsStringAsync()}");
+            return 1;
+        }
+    }
+
+    Console.WriteLine($"applied {slug}: {resources.Count} resource(s), {policies.Count} polic(ies)");
+    return 0;
+}
+
+async Task<int> ReportCommand()
+{
+    var path = Take() ?? throw Usage("`report <config.json>` requires a config file");
+    if (!File.Exists(path)) { Console.Error.WriteLine($"config not found: {path}"); return 1; }
+
+    var config = Json.Deserialize<ProjectConfig>(await File.ReadAllTextAsync(path));
+    if (config is null) { Console.Error.WriteLine("empty or invalid config"); return 1; }
+
+    using var http = Http(server);
+    using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+    // Normalize locally so report targets the same slug the upsert created.
+    string slug;
+    try
+    {
+        slug = Project.NormalizeSlug(config.Project.Slug);
+    }
+    catch (DomainException ex)
+    {
+        Console.Error.WriteLine($"invalid project slug: {ex.Message}");
+        return 1;
+    }
+
+    var reported = 0;
+    var failed = 0;
+    foreach (var r in config.Resources ?? [])
+    {
+        ObservedState state;
+        string? message = null;
+        string source = "report";
+
+        // The dashboard URL may be declared as a top-level `url` or inside
+        // `attributes.url` (as in integrations/overview.project.json): probe either.
+        var probeUrl = !string.IsNullOrWhiteSpace(r.Url)
+            ? r.Url
+            : r.Attributes is not null && r.Attributes.TryGetValue("url", out var attrUrl)
+                && !string.IsNullOrWhiteSpace(attrUrl) ? attrUrl : null;
+
+        if (!string.IsNullOrWhiteSpace(probeUrl))
+        {
+            try
+            {
+                var resp = await probe.GetAsync(probeUrl);
+                state = resp.IsSuccessStatusCode ? ObservedState.Healthy : ObservedState.Degraded;
+                if (!resp.IsSuccessStatusCode) message = $"HTTP {(int)resp.StatusCode}";
+            }
+            catch (Exception ex)
+            {
+                state = ObservedState.Unavailable;
+                message = ex.Message;
+            }
+        }
+        else if (r.Kind == ResourceKind.Service)
+        {
+            // Never report a service as healthy without probing it: that would
+            // conceal an outage and could satisfy verification incorrectly.
+            Console.Error.WriteLine($"skip {r.Kind.ToWire()}/{r.Key}: no url to probe");
+            continue;
+        }
+        else
+        {
+            // No probe target: report as healthy with no message (config-only resources).
+            state = ObservedState.Healthy;
+        }
+
+        var response = await http.PostAsJsonAsync($"/api/projects/{slug}/observations",
+            new ReportObservationRequest
+            {
+                Kind = r.Kind,
+                Key = r.Key,
+                Signal = r.Signal ?? Observation.DefaultSignal,
+                State = state,
+                Source = source,
+                Message = message,
+            }, Json.Default);
+        if (response.IsSuccessStatusCode) reported++;
+        else
+        {
+            failed++;
+            Console.Error.WriteLine($"observation {r.Kind.ToWire()}/{r.Key} refused: {await response.Content.ReadAsStringAsync()}");
+        }
+    }
+
+    Console.WriteLine($"reported {reported} observation(s) for {slug}");
+    return failed > 0 ? 1 : 0;
+}
+
 async Task<int> IncidentsCommand()
 {
     string? project = null;
@@ -635,3 +787,21 @@ sealed file class SseEventDto
         Seq = Seq, Kind = Kind, Message = Message, Data = Data, CreatedAt = CreatedAt,
     };
 }
+
+/// <summary>Declared project + resources + policies for `relay apply` / `relay report`.</summary>
+sealed record ProjectConfig(
+    [property: System.Text.Json.Serialization.JsonPropertyName("project")] ProjectConfigBody Project,
+    [property: System.Text.Json.Serialization.JsonPropertyName("resources")] List<ResourceConfig>? Resources,
+    [property: System.Text.Json.Serialization.JsonPropertyName("policies")] List<CreatePolicyRequest>? Policies);
+
+sealed record ProjectConfigBody(
+    [property: System.Text.Json.Serialization.JsonPropertyName("slug")] string Slug,
+    [property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name);
+
+sealed record ResourceConfig(
+    [property: System.Text.Json.Serialization.JsonPropertyName("kind")] ResourceKind Kind,
+    [property: System.Text.Json.Serialization.JsonPropertyName("key")] string Key,
+    [property: System.Text.Json.Serialization.JsonPropertyName("name")] string? Name,
+    [property: System.Text.Json.Serialization.JsonPropertyName("attributes")] Dictionary<string, string>? Attributes,
+    [property: System.Text.Json.Serialization.JsonPropertyName("url")] string? Url,
+    [property: System.Text.Json.Serialization.JsonPropertyName("signal")] string? Signal);

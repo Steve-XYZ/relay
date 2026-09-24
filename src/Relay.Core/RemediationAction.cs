@@ -21,6 +21,13 @@ public enum ActionKind
     /// the execution primitive; the action owns the intent and the audit trail.
     /// </summary>
     RunAgentTask,
+
+    /// <summary>
+    /// Run a short shell command synchronously (e.g. restart a process). No job: the command
+    /// is the intervention itself. Exit 0 means it ran; verification still decides whether
+    /// it worked.
+    /// </summary>
+    RunCommand,
 }
 
 /// <summary>

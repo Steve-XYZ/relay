@@ -200,6 +200,25 @@ public sealed class InMemoryControlPlaneStore : IControlPlaneStore
         lock (_gate)
         {
             var now = _clock.GetUtcNow();
+            var existing = _policies.Values.FirstOrDefault(p =>
+                p.ProjectId == projectId && p.Name == request.Name);
+
+            if (existing is not null)
+            {
+                // Idempotent re-apply: same name in the same project updates in place.
+                var updated = existing with
+                {
+                    Target = request.Target,
+                    Expectation = request.Expectation.Validated(),
+                    Severity = request.Severity,
+                    Remediation = request.Remediation.Validated(),
+                    Enabled = request.Enabled,
+                    UpdatedAt = now,
+                };
+                _policies[updated.Id] = updated;
+                return Task.FromResult(updated);
+            }
+
             var policy = new Policy
             {
                 Id = Guid.NewGuid(),

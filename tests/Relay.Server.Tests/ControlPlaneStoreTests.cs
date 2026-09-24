@@ -26,6 +26,18 @@ public class ControlPlaneStoreTests
     }
 
     [Fact]
+    public async Task A_policy_name_is_idempotent_within_a_project()
+    {
+        var cp = TestServiceFactory.CreateControlPlane();
+        var project = await ProjectAsync(cp);
+        var first = await PolicyAsync(cp, project, HealthyExpectation, new Remediation { Action = ActionKind.Notify });
+        var again = await PolicyAsync(cp, project, HealthyExpectation, new Remediation { Action = ActionKind.Notify });
+
+        Assert.Equal(first.Id, again.Id);
+        Assert.Single(await cp.Control.ListPoliciesAsync(project.Id, enabledOnly: false, default));
+    }
+
+    [Fact]
     public async Task Resource_attributes_merge_rather_than_replace()
     {
         // Two reporters each know part of the configuration; neither may erase the other's.
